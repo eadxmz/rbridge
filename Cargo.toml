@@ -1,0 +1,23 @@
+[package]
+name = "rbridge"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "rbridge"
+path = "src/main.rs"
+
+[[bin]]
+name = "rbridge-daemon"
+path = "src/bin/rbridge_daemon.rs"
+
+[dependencies]
+walkdir = "2.5"
+winreg = "0.56"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

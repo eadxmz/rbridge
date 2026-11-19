@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+*.pdb
+*.exe
+
+# Hard guard: never commit AMD driver binaries or packages to GitHub
+*.sys
+*.dll
+*.inf
+*.INF
+*.cat
+*.CAT
+*.cab
+*.msi
+*.7z
+*.zip
+*.rbridge_bak
