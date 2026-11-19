@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+use std::borrow::Cow;
 use std::thread;
 use std::time::Duration;
 use winreg::enums::*;
@@ -11,7 +12,7 @@ const GRAPHICS_DRIVERS: &str = r"SYSTEM\CurrentControlSet\Control\GraphicsDriver
 
 fn set_bin(key: &RegKey, name: &str, bytes: &[u8]) {
     let val = RegValue {
-        bytes: bytes.to_vec(),
+        bytes: Cow::Borrowed(bytes),
         vtype: REG_BINARY,
     };
     let _ = key.set_raw_value(name, &val);
@@ -41,8 +42,8 @@ fn enforce_amd_tweaks() {
             continue;
         };
 
-        let matching_id: String = gpu_key
-            .get_value("MatchingDeviceId")
+        let matching_id = gpu_key
+            .get_value::<String, _>("MatchingDeviceId")
             .unwrap_or_default()
             .to_ascii_lowercase();
 
