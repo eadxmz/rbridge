@@ -130,7 +130,7 @@ fn register_boot_guard() -> io::Result<()> {
 }
 
 fn menu_overclock() {
-    println!("\n--- Zero-RAM Native Overclock (atiadlxx.dll) ---");
+    println!("\n--- Zero-RAM Native Overclock (ADL + SoftPowerPlayTable) ---");
     let saved = oc::read_saved_oc();
     println!(
         "Boot Auto-OC: {} (Saved Core: {} MHz, Saved Mem: {} MHz)",
@@ -150,9 +150,10 @@ fn menu_overclock() {
                 "Memory Clock: {} MHz (Default: {} MHz | ADL Range: {}-{} MHz)",
                 st.memory_mhz, st.default_memory_mhz, st.min_memory_mhz, st.max_memory_mhz
             );
-            println!("\nTip: On 64-bit DDR3 Oland, step Memory Clock +25 MHz first (e.g. 900 -> 1025 MHz).");
-            println!("  a) Apply & Save Boot Overclock");
-            println!("  r) Reset to Factory Defaults & Disable Boot Auto-OC");
+            println!("States:       {}", st.levels_summary);
+            println!("\nTip: Step Memory Clock +25 MHz first (e.g. 900 -> 950 -> 1000 MHz).");
+            println!("  a) Apply & Save Overclock (auto-falls back to SoftPowerPlayTable if VBIOS locked)");
+            println!("  r) Reset to Factory Defaults & Restore SoftPowerPlayTable");
             println!("  b) Back");
 
             match prompt("Choice: ").to_ascii_lowercase().as_str() {
@@ -171,36 +172,44 @@ fn menu_overclock() {
                     match oc::apply_oc_clocks(target_e, target_m) {
                         Ok((applied_e, applied_m, api)) => {
                             println!(
-                                "[OK] Applied via {}: Core = {} MHz, Memory = {} MHz.",
+                                "[OK] Applied live via {}: Core = {} MHz, Memory = {} MHz.",
                                 api, applied_e, applied_m
                             );
                             if let Err(e) = oc::save_oc_profile(true, applied_e, applied_m) {
                                 println!("[WARN] Could not save boot OC profile: {}", e);
                             } else {
-                                println!("[OK] Saved to HKLM\\SOFTWARE\\RBridge (rbridge-daemon will auto-apply on boot).");
+                                println!("[OK] Saved to HKLM\\SOFTWARE\\RBridge.");
                             }
                         }
-                        Err(e) => println!("[ERR] {}", e),
+                        Err(adl_err) => {
+                            println!("[INFO] {} — trying SoftPowerPlayTable DPM mod...", adl_err);
+                            match oc::apply_soft_powerplay_mod(st.engine_mhz, st.memory_mhz, target_e, target_m) {
+                                Ok(hits) => {
+                                    let _ = oc::save_oc_profile(false, target_e, target_m);
+                                    println!(
+                                        "[OK] Patched {} DPM table entries in PP_PhmSoftPowerPlayTable ({}/{} MHz).",
+                                        hits, target_e, target_m
+                                    );
+                                    println!("[INFO] Reboot (or disable/enable AMD GPU in Device Manager) to activate new DPM clocks.");
+                                }
+                                Err(pp_err) => println!("[ERR] SoftPowerPlayTable mod failed: {}", pp_err),
+                            }
+                        }
                     }
                 }
                 "r" => {
                     let _ = oc::apply_oc_clocks(st.default_engine_mhz, st.default_memory_mhz);
                     let _ = oc::save_oc_profile(false, 0, 0);
-                    println!("[OK] Restored factory clocks and disabled boot auto-OC.");
+                    if oc::restore_soft_powerplay_table() {
+                        println!("[OK] Restored stock PP_PhmSoftPowerPlayTable backup. Reboot to apply.");
+                    } else {
+                        println!("[OK] Disabled boot auto-OC.");
+                    }
                 }
                 _ => {}
             }
         }
-        Err(e) => {
-            println!("[ERR] {}", e);
-            if saved.enabled
-                && prompt("Disable saved boot auto-OC anyway? [y/N]: ")
-                    .eq_ignore_ascii_case("y")
-            {
-                let _ = oc::save_oc_profile(false, 0, 0);
-                println!("[OK] Boot auto-OC disabled.");
-            }
-        }
+        Err(e) => println!("[ERR] {}", e),
     }
 }
 
