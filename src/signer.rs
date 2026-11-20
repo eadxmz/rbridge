@@ -6,6 +6,16 @@ use walkdir::WalkDir;
 const CERT_SUBJECT: &str = "CN=RBridge Local Driver Authority";
 
 fn find_wdk_tool(exe_name: &str) -> Option<PathBuf> {
+    // Check next to rbridge.exe first
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let local = dir.join(exe_name);
+            if local.exists() {
+                return Some(local);
+            }
+        }
+    }
+
     let kits_root = Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
     if !kits_root.exists() {
         return None;
@@ -70,19 +80,67 @@ Write-Output $cert.Thumbprint
     Ok(thumbprint)
 }
 
+fn sign_with_native_powershell(inf_dir: &Path, thumbprint: &str) -> io::Result<()> {
+    let ps_script = r#"
+$ErrorActionPreference = 'Stop'
+$dir = $env:RBRIDGE_INF_DIR
+$thumb = $env:RBRIDGE_THUMB
+$cert = Get-Item "Cert:\LocalMachine\My\$thumb"
+$tmpCat = Join-Path $env:TEMP 'rbridge_tmp.cat'
+
+foreach ($c in @('U0366524.CAT', 'U0369543.CAT')) {
+    $old = Join-Path $dir $c
+    if (Test-Path $old) { Remove-Item $old -Force }
+}
+if (Test-Path $tmpCat) { Remove-Item $tmpCat -Force }
+
+Write-Host "[..] Generating SHA-256 catalog via New-FileCatalog (this takes ~10-20s)..."
+New-FileCatalog -Path $dir -CatalogFilePath $tmpCat -CatalogVersion 2.0 | Out-Null
+
+$pairs = @(
+    @{ Inf = 'U0366524.INF'; Cat = 'U0366524.CAT' },
+    @{ Inf = 'U0369543.inf'; Cat = 'U0369543.CAT' }
+)
+
+foreach ($p in $pairs) {
+    if (Test-Path (Join-Path $dir $p.Inf)) {
+        $dst = Join-Path $dir $p.Cat
+        Copy-Item $tmpCat $dst -Force
+        $sig = Set-AuthenticodeSignature -FilePath $dst -Certificate $cert -HashAlgorithm SHA256
+        if ($sig.Status -ne 'Valid') {
+            throw "Failed to sign $($p.Cat): $($sig.Status) - $($sig.StatusMessage)"
+        }
+        Write-Host "[OK] Signed $($p.Cat) natively (SHA-256)."
+    }
+}
+
+Remove-Item $tmpCat -Force -ErrorAction SilentlyContinue
+"#;
+
+    let status = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script])
+        .env("RBRIDGE_INF_DIR", inf_dir)
+        .env("RBRIDGE_THUMB", thumbprint)
+        .status()?;
+
+    if !status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Native PowerShell catalog generation/signing failed.",
+        ));
+    }
+
+    println!("[OK] Catalogs re-signed natively (amdkmdag.sys WHQL signature untouched).");
+    Ok(())
+}
+
 pub fn rebuild_and_sign_catalogs(inf_dir: &Path, thumbprint: &str) -> io::Result<()> {
-    let inf2cat = find_wdk_tool("inf2cat.exe").ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "Inf2Cat.exe not found. Install Windows 10/11 WDK.",
-        )
-    })?;
-    let signtool = find_wdk_tool("signtool.exe").ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "signtool.exe not found. Install Windows 10/11 SDK.",
-        )
-    })?;
+    let (Some(inf2cat), Some(signtool)) =
+        (find_wdk_tool("inf2cat.exe"), find_wdk_tool("signtool.exe"))
+    else {
+        println!("[INFO] WDK not found - switching to built-in Windows PowerShell signing (no WDK needed).");
+        return sign_with_native_powershell(inf_dir, thumbprint);
+    };
 
     println!("[..] Running Inf2Cat on {}...", inf_dir.display());
     let cat_status = Command::new(&inf2cat)
