@@ -18,8 +18,9 @@ HKR,, EnableAspmL0s, %REG_DWORD%, 0
 HKR,, EnableAspmL1, %REG_DWORD%, 0
 HKR,, EnablePcieGen3, %REG_DWORD%, 1
 
-; === Enduro Copy-Back, DMA & Anti-Stutter Unlocks ===
+; === Enduro Copy-Back, SDMA & Anti-Stutter Unlocks ===
 HKR,, DisableDMACopy, %REG_DWORD%, 0
+HKR,, DisableSdma, %REG_DWORD%, 0
 HKR,, DisableBlockWrite, %REG_DWORD%, 0
 HKR,, DisableEarlyZ, %REG_DWORD%, 0
 HKR,, DisableFBC, %REG_DWORD%, 1
@@ -29,6 +30,9 @@ HKR,, KMD_EnableComputeQueue, %REG_DWORD%, 1
 HKR,, KMD_EnableInternalLargePage, %REG_DWORD%, 0
 HKR,, KMD_DeLagEnabled, %REG_DWORD%, 0
 HKR,, KMD_FRTEnabled, %REG_DWORD%, 0
+HKR,, KMD_RadeonBoostEnabled, %REG_DWORD%, 0
+HKR,, KMD_ChillEnabled, %REG_DWORD%, 0
+HKR,, KMD_EnhancedSyncEnabled, %REG_DWORD%, 0
 
 ; === Native OverDrive & PowerPlay Unlocks (Smooth Thermal Stepping ON) ===
 HKR,, PP_ODNFeatureEnable, %REG_DWORD%, 1
@@ -49,7 +53,7 @@ HKR,, OGL_EnableTripleBuffer, %REG_DWORD%, 0
 HKR,, OGL_ThreadControl, %REG_DWORD%, 1
 HKR,, OGL_EnableFastZClear, %REG_DWORD%, 1
 
-; === Unlocked UMD Gaming Profile (Catalyst AI + 2-Frame Enduro Queue + 4x Tess) ===
+; === Unlocked UMD Gaming, Vulkan Cache & Bandwidth Profile ===
 HKR, UMD, CatalystAI, %REG_BINARY%, 31,00
 HKR, UMD, CatalystAI_DEF, %REG_SZ%, "1"
 HKR, UMD, FlipQueueSize, %REG_BINARY%, 32,00
@@ -60,6 +64,7 @@ HKR, UMD, Main3D_SET, %REG_BINARY%, 32,00
 HKR, UMD, Main3D_DEF, %REG_SZ%, "2"
 HKR, UMD, ShaderCache, %REG_BINARY%, 32,00
 HKR, UMD, ShaderCache_DEF, %REG_SZ%, "2"
+HKR, UMD, ShaderCache_NA, %REG_SZ%, "0"
 HKR, UMD, SurfaceFormatReplacements, %REG_BINARY%, 31,00
 HKR, UMD, SurfaceFormatReplacements_DEF, %REG_SZ%, "1"
 HKR, UMD, SurfaceFormatReplacements_NA, %REG_SZ%, "0"
@@ -69,6 +74,10 @@ HKR, UMD, TFQ, %REG_BINARY%, 32,00
 HKR, UMD, TFQ_DEF, %REG_SZ%, "2"
 HKR, UMD, AnisoType, %REG_BINARY%, 30,00
 HKR, UMD, AnisoDegree, %REG_BINARY%, 30,00
+HKR, UMD, AntiAlias, %REG_BINARY%, 30,00
+HKR, UMD, AntiAliasSamples, %REG_BINARY%, 30,00
+HKR, UMD, EQAA, %REG_BINARY%, 30,00
+HKR, UMD, MLF, %REG_BINARY%, 30,00
 HKR, UMD, VSyncControl, %REG_BINARY%, 30,00
 HKR, UMD, VSyncControl_DEF, %REG_SZ%, "0"
 HKR, UMD, Tessellation_OPTION, %REG_BINARY%, 32,00
