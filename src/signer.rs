@@ -6,7 +6,6 @@ use walkdir::WalkDir;
 const CERT_SUBJECT: &str = "CN=RBridge Local Driver Authority";
 
 fn find_wdk_tool(exe_name: &str) -> Option<PathBuf> {
-    // Check next to rbridge.exe first
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let local = dir.join(exe_name);
@@ -138,7 +137,7 @@ pub fn rebuild_and_sign_catalogs(inf_dir: &Path, thumbprint: &str) -> io::Result
     let (Some(inf2cat), Some(signtool)) =
         (find_wdk_tool("inf2cat.exe"), find_wdk_tool("signtool.exe"))
     else {
-        println!("[INFO] WDK not found - switching to built-in Windows PowerShell signing (no WDK needed).");
+        println!("[INFO] WDK not found - switching to built-in Windows PowerShell signing.");
         return sign_with_native_powershell(inf_dir, thumbprint);
     };
 

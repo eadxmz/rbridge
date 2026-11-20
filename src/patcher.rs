@@ -18,29 +18,46 @@ HKR,, EnableAspmL0s, %REG_DWORD%, 0
 HKR,, EnableAspmL1, %REG_DWORD%, 0
 HKR,, EnablePcieGen3, %REG_DWORD%, 1
 
-; === PowerPlay & OverDrive Unlocks (GCN 1.0 Oland) ===
+; === Enduro Copy-Back, DMA & Anti-Stutter Unlocks ===
+HKR,, DisableDMACopy, %REG_DWORD%, 0
+HKR,, DisableBlockWrite, %REG_DWORD%, 0
+HKR,, DisableEarlyZ, %REG_DWORD%, 0
+HKR,, DisableFBC, %REG_DWORD%, 1
+HKR,, DisableDrmdmaPowerGating, %REG_DWORD%, 1
+HKR,, KMD_EnablePreemption, %REG_DWORD%, 0
+HKR,, KMD_EnableComputeQueue, %REG_DWORD%, 1
+HKR,, KMD_EnableInternalLargePage, %REG_DWORD%, 0
+HKR,, KMD_DeLagEnabled, %REG_DWORD%, 0
+HKR,, KMD_FRTEnabled, %REG_DWORD%, 0
+
+; === Native OverDrive & PowerPlay Unlocks (Smooth Thermal Stepping ON) ===
 HKR,, PP_ODNFeatureEnable, %REG_DWORD%, 1
 HKR,, PP_DisablePowerContainment, %REG_DWORD%, 1
+HKR,, PP_DisableClockStretching, %REG_DWORD%, 1
+HKR,, PP_DisableULV, %REG_DWORD%, 1
 HKR,, PP_SclkDeepSleepDisable, %REG_DWORD%, 1
 HKR,, PP_MclkDeepSleepDisable, %REG_DWORD%, 1
-HKR,, PP_ThermalAutoThrottlingEnable, %REG_DWORD%, 0
+HKR,, PP_ThermalAutoThrottlingEnable, %REG_DWORD%, 1
 HKR,, PP_PhmUseDummyBackEnd, %REG_DWORD%, 0
-HKR,, KMD_DeLagEnabled, %REG_DWORD%, 1
 
 ; === DAL Custom Modes (Gamma/Color LUT Untouched for Intel iGPU) ===
 HKR,, DALRULE_AllowNonCEModes, %REG_DWORD%, 1
 
-; === OpenGL & Memory Allocation ===
+; === Unlocked OpenGL Multi-Threading & HyperZ ===
 HKR,, OGL_VBO_Alloc_Policy, %REG_DWORD%, 1
 HKR,, OGL_EnableTripleBuffer, %REG_DWORD%, 0
+HKR,, OGL_ThreadControl, %REG_DWORD%, 1
+HKR,, OGL_EnableFastZClear, %REG_DWORD%, 1
 
-; === UMD DirectX / Bandwidth / Geometry Engine Optimization ===
-HKR, UMD, FlipQueueSize, %REG_BINARY%, 31,00
-HKR, UMD, FlipQueueSize_SET, %REG_BINARY%, 31,00
-HKR, UMD, FlipQueueSize_DEF, %REG_SZ%, "1"
-HKR, UMD, Main3D, %REG_BINARY%, 31,00
-HKR, UMD, Main3D_SET, %REG_BINARY%, 31,00
-HKR, UMD, Main3D_DEF, %REG_SZ%, "1"
+; === Unlocked UMD Gaming Profile (Catalyst AI + 2-Frame Enduro Queue + 4x Tess) ===
+HKR, UMD, CatalystAI, %REG_BINARY%, 31,00
+HKR, UMD, CatalystAI_DEF, %REG_SZ%, "1"
+HKR, UMD, FlipQueueSize, %REG_BINARY%, 32,00
+HKR, UMD, FlipQueueSize_SET, %REG_BINARY%, 32,00
+HKR, UMD, FlipQueueSize_DEF, %REG_SZ%, "2"
+HKR, UMD, Main3D, %REG_BINARY%, 32,00
+HKR, UMD, Main3D_SET, %REG_BINARY%, 32,00
+HKR, UMD, Main3D_DEF, %REG_SZ%, "2"
 HKR, UMD, ShaderCache, %REG_BINARY%, 32,00
 HKR, UMD, ShaderCache_DEF, %REG_SZ%, "2"
 HKR, UMD, SurfaceFormatReplacements, %REG_BINARY%, 31,00
@@ -52,11 +69,12 @@ HKR, UMD, TFQ, %REG_BINARY%, 32,00
 HKR, UMD, TFQ_DEF, %REG_SZ%, "2"
 HKR, UMD, AnisoType, %REG_BINARY%, 30,00
 HKR, UMD, AnisoDegree, %REG_BINARY%, 30,00
-; Cap Tessellation to 8x (Protects Oland's Single Geometry Engine)
+HKR, UMD, VSyncControl, %REG_BINARY%, 30,00
+HKR, UMD, VSyncControl_DEF, %REG_SZ%, "0"
 HKR, UMD, Tessellation_OPTION, %REG_BINARY%, 32,00
 HKR, UMD, Tessellation_OPTION_DEF, %REG_SZ%, "2"
-HKR, UMD, Tessellation, %REG_BINARY%, 38,00
-HKR, UMD, Tessellation_DEF, %REG_SZ%, "8"
+HKR, UMD, Tessellation, %REG_BINARY%, 34,00
+HKR, UMD, Tessellation_DEF, %REG_SZ%, "4"
 "#;
 
 pub fn find_target_infs(root: &Path) -> Vec<PathBuf> {
