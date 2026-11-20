@@ -147,14 +147,12 @@ pub fn patch_inf_in_place(inf_path: &Path, enable_msi: bool) -> io::Result<()> {
             in_strings_section = lower == "[strings]";
         }
 
-        // 1. Prevent 0x139 D3cold Split-Brain BSOD
         if lower.contains("addreg") && lower.contains("ati2mtag_px_dgpu_only_2id") {
             output.push(format!("; [RBridge stripped BSOD conflict] {}", line));
             stripped_px_count += 1;
             continue;
         }
 
-        // 2. Clean Branding inside [Strings] ONLY (preserves true Oland ASIC mapping)
         if in_strings_section {
             if lower.starts_with("amd6660.1") {
                 output.push(r#"AMD6660.1 = "AMD Radeon R8 M670""#.to_string());
@@ -166,7 +164,6 @@ pub fn patch_inf_in_place(inf_path: &Path, enable_msi: bool) -> io::Result<()> {
             }
         }
 
-        // 3. Optional MSI toggle
         if !enable_msi && lower.contains("msisupported") && lower.contains("0x00000001") {
             output.push(line.replace("0x00000001", "0x00000000"));
             continue;
@@ -174,7 +171,6 @@ pub fn patch_inf_in_place(inf_path: &Path, enable_msi: bool) -> io::Result<()> {
 
         output.push(line.to_string());
 
-        // 4. Inject MasterTweaks strictly AFTER DelReg so Windows PnP never wipes them
         if lower.contains("delreg") && lower.contains("ati2mtag_removedevicesettings") {
             output.push(format!("AddReg = {}", SECTION_NAME));
             injected_count += 1;

@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+use rbridge::{oc, vram_guard};
 use std::borrow::Cow;
 use std::fs;
 use std::os::windows::process::CommandExt;
@@ -31,15 +32,22 @@ fn set_bin(key: &RegKey, name: &str, bytes: &[u8]) {
     let _ = key.set_raw_value(name, &val);
 }
 
-fn disable_pcie_aspm_silent() {
-    let _ = Command::new("powercfg")
-        .args(["/setacvalueindex", "SCHEME_CURRENT", "SUB_PCIEXPRESS", "ASPM", "0"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    let _ = Command::new("powercfg")
-        .args(["/setactive", "SCHEME_CURRENT"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+fn tune_ac_power_plan_silent() {
+    // AC power only (leaves DC/battery power untouched):
+    // 1. Disable PCIe ASPM to eliminate Enduro copy-back micro-stalls
+    // 2. Unpark 100% of CPU cores to flatten DX11/Vulkan draw-call submission
+    let cmds: &[&[&str]] = &[
+        &["/setacvalueindex", "SCHEME_CURRENT", "SUB_PCIEXPRESS", "ASPM", "0"],
+        &["/setacvalueindex", "SCHEME_CURRENT", "SUB_PROCESSOR", "CPMINCORES", "100"],
+        &["/setacvalueindex", "SCHEME_CURRENT", "SUB_PROCESSOR", "CPMAXCORES", "100"],
+        &["/setactive", "SCHEME_CURRENT"],
+    ];
+    for args in cmds {
+        let _ = Command::new("powercfg")
+            .args(*args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
 }
 
 fn find_latest_vulkan_json(filename: &str, fallback_dir: &str) -> Option<String> {
@@ -88,7 +96,6 @@ fn sync_vulkan_icd_key(hklm: &RegKey, reg_path: &str, json_filename: &str, fallb
         return;
     };
 
-    // Prune dead AMD Vulkan ICD entries left behind by removed drivers
     let stale: Vec<String> = drivers_key
         .enum_values()
         .filter_map(|v| v.ok())
@@ -104,19 +111,16 @@ fn sync_vulkan_icd_key(hklm: &RegKey, reg_path: &str, json_filename: &str, fallb
         let _ = drivers_key.delete_value(&bad);
     }
 
-    // Register active 21.Q2.1 AMD Vulkan ICD (DWORD 0 = enabled in Khronos Loader)
     if let Some(live_json) = find_latest_vulkan_json(json_filename, fallback_dir) {
         let _ = drivers_key.set_value(&live_json, &0u32);
     }
 }
 
 fn enforce_vulkan_stack(hklm: &RegKey) {
-    // 1. Disable buggy switchable-graphics Vulkan layer on driver-only Enduro setups
     if let Ok(env_key) = hklm.open_subkey_with_flags(SYS_ENV, KEY_WRITE) {
         let _ = env_key.set_value("DISABLE_LAYER_AMD_SWITCHABLE_GRAPHICS_1", &"1");
     }
 
-    // 2. Ensure both 64-bit and 32-bit AMD Vulkan ICDs point to live 21.Q2.1 manifests
     sync_vulkan_icd_key(
         hklm,
         r"SOFTWARE\Khronos\Vulkan\Drivers",
@@ -151,7 +155,7 @@ fn boost_amd_msi_priority(hklm: &RegKey) {
                 dev, inst
             );
             if let Ok((aff_key, _)) = hklm.create_subkey(&aff_path) {
-                let _ = aff_key.set_value("DevicePriority", &3u32); // High interrupt priority
+                let _ = aff_key.set_value("DevicePriority", &3u32);
             }
         }
     }
@@ -160,24 +164,20 @@ fn boost_amd_msi_priority(hklm: &RegKey) {
 fn enforce_amd_tweaks() {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
 
-    // 1. Global 10s TDR protection & HAGS off (GCN 1.0 stability)
     if let Ok(gd) = hklm.open_subkey_with_flags(GRAPHICS_DRIVERS, KEY_WRITE) {
         let _ = gd.set_value("TdrDelay", &10u32);
         let _ = gd.set_value("TdrDdiDelay", &10u32);
         let _ = gd.set_value("HwSchMode", &1u32);
     }
 
-    // 2. Disable Windows MPO (fixes hybrid Intel + AMD frame-pacing stutters)
     if let Ok((dwm, _)) = hklm.create_subkey(DWM_KEY) {
         let _ = dwm.set_value("OverlayTestMode", &5u32);
     }
 
-    // 3. Disable Xbox Game DVR overlay hooks (saves ~150-250 MB VRAM on 2 GB card)
     if let Ok((dvr, _)) = hklm.create_subkey(GAMEDVR_POLICY) {
         let _ = dvr.set_value("AllowGameDVR", &0u32);
     }
 
-    // 4. Boost game thread, GPU priority & kill network/DPC throttling in MMCSS
     if let Ok(prof) = hklm.open_subkey_with_flags(MMCSS_PROFILE, KEY_WRITE) {
         let _ = prof.set_value("SystemResponsiveness", &10u32);
         let _ = prof.set_value("NetworkThrottlingIndex", &0xFFFF_FFFFu32);
@@ -189,11 +189,9 @@ fn enforce_amd_tweaks() {
         let _ = games.set_value("SFIO Priority", &"High");
     }
 
-    // 5. Vulkan stack repair + High MSI interrupt priority for AMD 8670M
     enforce_vulkan_stack(&hklm);
     boost_amd_msi_priority(&hklm);
 
-    // 6. Dynamically locate AMD Oland dGPU key (never touch Intel iGPU or gamma)
     let Ok(class_key) = hklm.open_subkey_with_flags(DISPLAY_CLASS, KEY_READ) else {
         return;
     };
@@ -216,7 +214,6 @@ fn enforce_amd_tweaks() {
             continue;
         }
 
-        // Stability, Enduro SDMA copy-back & anti-stutter unlocks
         let _ = gpu_key.set_value("EnableUlps", &0u32);
         let _ = gpu_key.set_value("EnableUlps_NA", &"0");
         let _ = gpu_key.set_value("PP_GPUPowerDownEnabled", &0u32);
@@ -233,7 +230,6 @@ fn enforce_amd_tweaks() {
         let _ = gpu_key.set_value("DisableFBC", &1u32);
         let _ = gpu_key.set_value("DisableDrmdmaPowerGating", &1u32);
 
-        // Unlocked GCN 1.0 KMD queue & scheduling tweaks (Intel iGPU unaffected)
         let _ = gpu_key.set_value("KMD_EnablePreemption", &0u32);
         let _ = gpu_key.set_value("KMD_EnableComputeQueue", &1u32);
         let _ = gpu_key.set_value("KMD_EnableInternalLargePage", &0u32);
@@ -243,7 +239,6 @@ fn enforce_amd_tweaks() {
         let _ = gpu_key.set_value("KMD_ChillEnabled", &0u32);
         let _ = gpu_key.set_value("KMD_EnhancedSyncEnabled", &0u32);
 
-        // Native OverDrive & PowerPlay unlocks (smooth thermal stepping kept ON)
         let _ = gpu_key.set_value("PP_ODNFeatureEnable", &1u32);
         let _ = gpu_key.set_value("PP_DisablePowerContainment", &1u32);
         let _ = gpu_key.set_value("PP_DisableClockStretching", &1u32);
@@ -253,13 +248,11 @@ fn enforce_amd_tweaks() {
         let _ = gpu_key.set_value("PP_ThermalAutoThrottlingEnable", &1u32);
         let _ = gpu_key.set_value("PP_PhmUseDummyBackEnd", &0u32);
 
-        // Unlocked OpenGL multi-threading & HyperZ
         let _ = gpu_key.set_value("OGL_VBO_Alloc_Policy", &1u32);
         let _ = gpu_key.set_value("OGL_EnableTripleBuffer", &0u32);
         let _ = gpu_key.set_value("OGL_ThreadControl", &1u32);
         let _ = gpu_key.set_value("OGL_EnableFastZClear", &1u32);
 
-        // Unlocked UMD gaming, Vulkan cache & bandwidth profile (no gamma keys)
         if let Ok((umd, _)) = gpu_key.create_subkey("UMD") {
             set_bin(&umd, "CatalystAI", &[0x31, 0x00]);
             let _ = umd.set_value("CatalystAI_DEF", &"1");
@@ -292,7 +285,9 @@ fn enforce_amd_tweaks() {
 
 fn main() {
     enforce_amd_tweaks();
-    disable_pcie_aspm_silent();
+    tune_ac_power_plan_silent();
+    vram_guard::apply_to_all_loaded_users();
     thread::sleep(Duration::from_secs(12));
     enforce_amd_tweaks();
+    oc::apply_saved_oc();
 }

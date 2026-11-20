@@ -1,6 +1,4 @@
-mod patcher;
-mod signer;
-
+use rbridge::{oc, patcher, res_injector, signer, vram_guard};
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -117,25 +115,190 @@ fn register_boot_guard() -> io::Result<()> {
     if status.success() {
         println!("[OK] Windowless boot guard registered (Task: RBridge_Oland_Guard).");
         let _ = Command::new(&daemon).spawn();
-        println!("[OK] Applied live registry optimizations.");
+        match vram_guard::apply_to_current_user() {
+            Ok(n) => println!(
+                "[OK] Applied Flip Model + VRAM quarantine ({} background apps pinned to Intel).",
+                n
+            ),
+            Err(e) => println!("[WARN] VRAM quarantine warning: {}", e),
+        }
+        println!("[OK] Applied live KMD/UMD/Vulkan/MSI/AC-power optimizations.");
     } else {
         println!("[ERR] Failed to register Scheduled Task.");
     }
     Ok(())
 }
 
+fn menu_overclock() {
+    println!("\n--- Zero-RAM Native Overclock (atiadlxx.dll) ---");
+    let saved = oc::read_saved_oc();
+    println!(
+        "Boot Auto-OC: {} (Saved Core: {} MHz, Saved Mem: {} MHz)",
+        if saved.enabled { "ENABLED" } else { "OFF" },
+        saved.engine_mhz,
+        saved.memory_mhz
+    );
+
+    match oc::query_oc_status() {
+        Ok(st) => {
+            println!("Adapter:      {} ({})", st.adapter_name, st.backend);
+            println!(
+                "Core Clock:   {} MHz (Default: {} MHz | ADL Range: {}-{} MHz)",
+                st.engine_mhz, st.default_engine_mhz, st.min_engine_mhz, st.max_engine_mhz
+            );
+            println!(
+                "Memory Clock: {} MHz (Default: {} MHz | ADL Range: {}-{} MHz)",
+                st.memory_mhz, st.default_memory_mhz, st.min_memory_mhz, st.max_memory_mhz
+            );
+            println!("\nTip: On 64-bit DDR3 Oland, step Memory Clock +25 MHz first (e.g. 900 -> 1025 MHz).");
+            println!("  a) Apply & Save Boot Overclock");
+            println!("  r) Reset to Factory Defaults & Disable Boot Auto-OC");
+            println!("  b) Back");
+
+            match prompt("Choice: ").to_ascii_lowercase().as_str() {
+                "a" => {
+                    let e_in = prompt(&format!(
+                        "Target Core MHz [Enter to keep {}]: ",
+                        st.engine_mhz
+                    ));
+                    let m_in = prompt(&format!(
+                        "Target Memory MHz [Enter to keep {}]: ",
+                        st.memory_mhz
+                    ));
+                    let target_e = e_in.parse::<u32>().unwrap_or(st.engine_mhz);
+                    let target_m = m_in.parse::<u32>().unwrap_or(st.memory_mhz);
+
+                    match oc::apply_oc_clocks(target_e, target_m) {
+                        Ok((applied_e, applied_m, api)) => {
+                            println!(
+                                "[OK] Applied via {}: Core = {} MHz, Memory = {} MHz.",
+                                api, applied_e, applied_m
+                            );
+                            if let Err(e) = oc::save_oc_profile(true, applied_e, applied_m) {
+                                println!("[WARN] Could not save boot OC profile: {}", e);
+                            } else {
+                                println!("[OK] Saved to HKLM\\SOFTWARE\\RBridge (rbridge-daemon will auto-apply on boot).");
+                            }
+                        }
+                        Err(e) => println!("[ERR] {}", e),
+                    }
+                }
+                "r" => {
+                    let _ = oc::apply_oc_clocks(st.default_engine_mhz, st.default_memory_mhz);
+                    let _ = oc::save_oc_profile(false, 0, 0);
+                    println!("[OK] Restored factory clocks and disabled boot auto-OC.");
+                }
+                _ => {}
+            }
+        }
+        Err(e) => {
+            println!("[ERR] {}", e);
+            if saved.enabled
+                && prompt("Disable saved boot auto-OC anyway? [y/N]: ")
+                    .eq_ignore_ascii_case("y")
+            {
+                let _ = oc::save_oc_profile(false, 0, 0);
+                println!("[OK] Boot auto-OC disabled.");
+            }
+        }
+    }
+}
+
+fn menu_custom_resolutions() {
+    println!("\n--- 16:9 Custom Resolution Injector (Exclusive Fullscreen) ---");
+    let displays = res_injector::list_displays();
+    if displays.is_empty() {
+        println!("[ERR] No EDID displays found in registry.");
+        return;
+    }
+
+    for (i, d) in displays.iter().enumerate() {
+        println!(
+            "  {}) {} ({}x{} @ {}Hz){}{}",
+            i + 1,
+            d.model,
+            d.native_w,
+            d.native_h,
+            d.refresh_hz,
+            if d.active { " [ACTIVE]" } else { "" },
+            if d.has_override { " [CUSTOM RES INSTALLED]" } else { "" }
+        );
+    }
+
+    let sel = prompt("\nSelect display number (0 to cancel): ");
+    let Ok(num) = sel.parse::<usize>() else {
+        return;
+    };
+    if num == 0 || num > displays.len() {
+        return;
+    }
+    let target = &displays[num - 1];
+
+    println!("  a) Inject lower 16:9 resolutions (EDID_OVERRIDE)");
+    println!("  r) Remove EDID_OVERRIDE (restore factory EDID)");
+    match prompt("Choice: ").to_ascii_lowercase().as_str() {
+        "a" => match res_injector::inject_16_9_modes(target) {
+            Ok(modes) => {
+                let list: Vec<String> = modes
+                    .iter()
+                    .map(|(w, h)| format!("{}x{}", w, h))
+                    .collect();
+                println!("[OK] Injected 16:9 modes for {}: {}", target.model, list.join(", "));
+                println!("[INFO] Reboot once to activate. In Intel Graphics Control Panel, set Scaling -> Scale Full Screen.");
+            }
+            Err(e) => println!("[ERR] Injection failed: {}", e),
+        },
+        "r" => match res_injector::remove_override(target) {
+            Ok(()) => println!("[OK] Removed EDID_OVERRIDE for {}. Reboot to restore factory modes.", target.model),
+            Err(e) => println!("[ERR] Failed to remove override: {}", e),
+        },
+        _ => {}
+    }
+}
+
+fn menu_vram_quarantine() {
+    println!("\n--- 2 GB VRAM Quarantine & DX10/DX11 Flip Model ---");
+    println!("  a) Auto-Quarantine Browsers/Discord/Steam to Intel + Force Flip Model");
+    println!("  g) Pin a Game .exe to AMD Radeon R8 M670 (High Performance)");
+    println!("  b) Back");
+
+    match prompt("Choice: ").to_ascii_lowercase().as_str() {
+        "a" => match vram_guard::apply_to_current_user() {
+            Ok(n) => println!(
+                "[OK] Forced Flip Model (SwapEffectUpgradeEnable=1) and pinned {} background apps to Intel iGPU.",
+                n
+            ),
+            Err(e) => println!("[ERR] {}", e),
+        },
+        "g" => {
+            let p = prompt("Full path to game .exe (you can drag-and-drop it here): ");
+            if p.is_empty() {
+                return;
+            }
+            match vram_guard::pin_game_to_amd(Path::new(&p)) {
+                Ok(()) => println!("[OK] Pinned {} to AMD High Performance (GpuPreference=2;).", p),
+                Err(e) => println!("[ERR] {}", e),
+            }
+        }
+        _ => {}
+    }
+}
+
 fn main() {
     println!("====================================================");
-    println!("  RBridge v1.0 - AMD Radeon HD 8670M (21.Q2.1)");
-    println!("  Peak GCN 1.0 Oland Patcher, Signer & Boot Guard");
+    println!("  RBridge v1.4 - AMD Radeon HD 8670M (21.Q2.1)");
+    println!("  Peak GCN 1.0 Patcher, Signer, OC & Res Suite");
     println!("====================================================");
 
     loop {
-        println!("\n1) Full Pipeline: Patch INFs + Sign Catalogs + Driver-Only Install");
+        println!("\n1) Full Pipeline: Patch INFs + Sign + Install + Boot Guard");
         println!("2) Patch Dual INFs Only (U0366524.INF & U0369543.inf)");
-        println!("3) Rebuild & Sign Catalogs Only (No Test Mode)");
-        println!("4) Install Windowless Boot Guard & Apply Live Tweaks Now");
-        println!("5) Remove Boot Guard Scheduled Task");
+        println!("3) Rebuild & Sign Catalogs Only (Zero-WDK)");
+        println!("4) Install Windowless Boot Guard & Apply All Live Tweaks");
+        println!("5) Native Overclock (Zero-RAM ADL via atiadlxx.dll)");
+        println!("6) 16:9 Custom Resolution Injector (Exclusive Fullscreen)");
+        println!("7) VRAM Quarantine & Flip Model (Pin Apps to Intel / Games to AMD)");
+        println!("8) Remove Boot Guard Scheduled Task");
         println!("0) Exit");
 
         match prompt("\nSelect option: ").as_str() {
@@ -166,7 +329,10 @@ fn main() {
                     println!("[ERR] {}", e);
                 }
             }
-            "5" => {
+            "5" => menu_overclock(),
+            "6" => menu_custom_resolutions(),
+            "7" => menu_vram_quarantine(),
+            "8" => {
                 let _ = Command::new("schtasks")
                     .args(["/Delete", "/TN", "RBridge_Oland_Guard", "/F"])
                     .status();
