@@ -143,11 +143,13 @@ impl RBridgeApp {
                         match res {
                             Ok(msg) => {
                                 self.patch_logs.push(format!("[DONE] {}", msg));
-                                self.set_status(msg, false);
+                                self.status_line = msg;
+                                self.status_is_error = false;
                             }
                             Err(err) => {
                                 self.patch_logs.push(format!("[ERR] {}", err));
-                                self.set_status(err, true);
+                                self.status_line = err;
+                                self.status_is_error = true;
                             }
                         }
                     }
@@ -166,7 +168,7 @@ impl RBridgeApp {
     fn card_frame() -> egui::Frame {
         egui::Frame::none()
             .fill(CARD_BG)
-            .stroke(egui::Stroke::new(1.0, CARD_BORDER))
+            .stroke(egui::Stroke::new(1.0_f32, CARD_BORDER))
             .rounding(egui::Rounding::same(6.0))
             .inner_margin(egui::Margin::same(14.0))
     }
@@ -181,7 +183,7 @@ impl RBridgeApp {
     fn secondary_btn(label: &str) -> egui::Button<'_> {
         egui::Button::new(egui::RichText::new(label).color(TEXT_PRIMARY))
             .fill(egui::Color32::from_rgb(35, 42, 53))
-            .stroke(egui::Stroke::new(1.0, CARD_BORDER))
+            .stroke(egui::Stroke::new(1.0_f32, CARD_BORDER))
             .rounding(egui::Rounding::same(5.0))
             .min_size(egui::vec2(120.0, 30.0))
     }
@@ -192,7 +194,7 @@ impl RBridgeApp {
             .frame(
                 egui::Frame::none()
                     .fill(RAIL_BG)
-                    .stroke(egui::Stroke::new(1.0, CARD_BORDER))
+                    .stroke(egui::Stroke::new(1.0_f32, CARD_BORDER))
                     .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
             )
             .show(ctx, |ui| {
@@ -250,7 +252,7 @@ impl RBridgeApp {
             .frame(
                 egui::Frame::none()
                     .fill(RAIL_BG)
-                    .stroke(egui::Stroke::new(1.0, CARD_BORDER))
+                    .stroke(egui::Stroke::new(1.0_f32, CARD_BORDER))
                     .inner_margin(egui::Margin::same(12.0)),
             )
             .show(ctx, |ui| {
@@ -318,7 +320,7 @@ impl RBridgeApp {
             .frame(
                 egui::Frame::none()
                     .fill(RAIL_BG)
-                    .stroke(egui::Stroke::new(1.0, CARD_BORDER))
+                    .stroke(egui::Stroke::new(1.0_f32, CARD_BORDER))
                     .inner_margin(egui::Margin::symmetric(14.0, 6.0)),
             )
             .show(ctx, |ui| {
@@ -956,14 +958,14 @@ fn apply_radeon_pro_theme(ctx: &egui::Context) {
     visuals.extreme_bg_color = egui::Color32::from_rgb(12, 15, 19);
     visuals.faint_bg_color = egui::Color32::from_rgb(24, 29, 36);
     visuals.selection.bg_fill = PRO_BLUE;
-    visuals.selection.stroke = egui::Stroke::new(1.0, PRO_BLUE_BRIGHT);
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, PRO_BLUE_BRIGHT);
     visuals.widgets.noninteractive.bg_fill = CARD_BG;
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, CARD_BORDER);
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, CARD_BORDER);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT_PRIMARY);
     visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(35, 42, 53);
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, CARD_BORDER);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, CARD_BORDER);
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(44, 55, 70);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, PRO_BLUE_BRIGHT);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, PRO_BLUE_BRIGHT);
     visuals.widgets.active.bg_fill = PRO_BLUE;
     ctx.set_visuals(visuals);
 }
