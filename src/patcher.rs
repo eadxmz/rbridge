@@ -103,11 +103,11 @@ fn rid_priority(path: &Path) -> (u8, String) {
         .to_string_lossy()
         .to_ascii_lowercase();
     let tier = if name.contains("gcnstd") {
-        0 // Consumer GCN Standard (native OverDrive)
+        0
     } else if name.contains("gcnflexdgpu") {
-        1 // GCN Flexible dGPU
+        1
     } else if name.contains("gcnpro") {
-        2 // GCN Pro Workstation
+        2
     } else {
         3
     };
@@ -170,7 +170,6 @@ pub fn detect_driver_package(dir: &Path) -> DetectedPackage {
     };
 
     if !chosen.is_empty() {
-        // Sort by preferred tier (gcnstd -> gcnflexdgpu -> gcnpro), newest build number first
         chosen.sort_by(|a, b| {
             let (ta, na) = rid_priority(a);
             let (tb, nb) = rid_priority(b);
@@ -211,11 +210,9 @@ fn should_strip_inf_line(line_lower: &str) -> bool {
         "amdow.exe",
         "amddvr.exe",
         "cncmd.exe",
-        "amdfendr",
         "auepmaster",
         "aueplauncher",
         "amduserexperience",
-        "amdcrashdefender",
     ];
     let trimmed = line_lower.trim_start();
     if trimmed.starts_with(';') || trimmed.starts_with('[') {
@@ -224,7 +221,7 @@ fn should_strip_inf_line(line_lower: &str) -> bool {
     TOKENS.iter().any(|tok| trimmed.contains(tok))
 }
 
-fn neutralize_standalone_bloat_dirs(root: &Path, log: &impl Fn(String)) -> usize {
+fn neutralize_ccc2_dirs(root: &Path, log: &impl Fn(String)) -> usize {
     let mut stripped = 0usize;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -241,11 +238,11 @@ fn neutralize_standalone_bloat_dirs(root: &Path, log: &impl Fn(String)) -> usize
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_ascii_lowercase();
-            if name.contains("ccc2_install") || name == "amdfendr" {
+            if name.contains("ccc2_install") && !name.ends_with(".rbridge_stripped") {
                 let renamed = p.with_extension("rbridge_stripped");
                 if fs::rename(&p, &renamed).is_ok() {
                     stripped += 1;
-                    log(format!("[DEBLOAT] Neutralized standalone bloat folder '{}'", name));
+                    log(format!("[DEBLOAT] Neutralized Adrenalin UI folder '{}'", name));
                 }
             } else {
                 stack.push(p);
@@ -255,27 +252,37 @@ fn neutralize_standalone_bloat_dirs(root: &Path, log: &impl Fn(String)) -> usize
     stripped
 }
 
-fn heal_and_clean_driver_dir(dir: &Path, log: &impl Fn(String)) {
+fn heal_and_clean_package_tree(root: &Path, log: &impl Fn(String)) {
     let backup_dir = env::temp_dir().join("RBridge_INF_Backups");
     let _ = fs::create_dir_all(&backup_dir);
 
-    let mut stack = vec![dir.to_path_buf()];
+    let mut stack = vec![root.to_path_buf()];
+    let mut restored_files = 0usize;
     while let Some(cur) = stack.pop() {
         let Ok(entries) = fs::read_dir(&cur) else {
             continue;
         };
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_dir() {
-                stack.push(p);
-                continue;
-            }
             let name = p
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
             let lower = name.to_ascii_lowercase();
+
+            if p.is_dir() {
+                if lower == "amdfendr.rbridge_stripped" {
+                    let dst = cur.join("amdfendr");
+                    if fs::rename(&p, &dst).is_ok() {
+                        log("[CLEAN] Restored 'amdfendr' folder for clean INF CopyFiles".into());
+                        stack.push(dst);
+                    }
+                } else {
+                    stack.push(p);
+                }
+                continue;
+            }
 
             if lower.ends_with(".rbridge_bak") {
                 let dst = backup_dir.join(&name);
@@ -286,11 +293,278 @@ fn heal_and_clean_driver_dir(dir: &Path, log: &impl Fn(String)) {
                 let restored_name = &name[..name.len() - ".rbridge_stripped".len()];
                 let dst = cur.join(restored_name);
                 if fs::rename(&p, &dst).is_ok() {
-                    log(format!("[CLEAN] Restored '{}' for clean catalog hashing", restored_name));
+                    restored_files += 1;
                 }
             }
         }
     }
+    if restored_files > 0 {
+        log(format!(
+            "[CLEAN] Restored {} previously renamed binary file(s) so pnputil finds all payloads",
+            restored_files
+        ));
+    }
+}
+
+fn clean_rel_subpath(raw: &str) -> String {
+    let s = raw
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"')
+        .trim_start_matches(".\\")
+        .trim_start_matches("./")
+        .trim_matches(['\\', '/']);
+    s.to_string()
+}
+
+fn parse_inf_payload_refs(inf_path: &Path) -> Vec<PathBuf> {
+    let Ok(raw) = fs::read_to_string(inf_path) else {
+        return Vec::new();
+    };
+
+    let mut strings: BTreeMap<String, String> = BTreeMap::new();
+    let mut disk_paths: BTreeMap<String, String> = BTreeMap::new();
+    let mut sys_dll_refs: Vec<PathBuf> = Vec::new();
+    let mut other_refs: Vec<PathBuf> = Vec::new();
+
+    #[derive(PartialEq, Eq)]
+    enum Sec {
+        None,
+        Strings,
+        Disks,
+        Files,
+    }
+
+    // Pass 1: Strings + SourceDisksNames
+    let mut sec = Sec::None;
+    for line in raw.lines() {
+        let trim = line.trim();
+        if trim.is_empty() || trim.starts_with(';') {
+            continue;
+        }
+        if trim.starts_with('[') && trim.ends_with(']') {
+            let low = trim.to_ascii_lowercase();
+            sec = if low == "[strings]" || low.starts_with("[strings.") {
+                Sec::Strings
+            } else if low == "[sourcedisksnames]" || low.starts_with("[sourcedisksnames.") {
+                Sec::Disks
+            } else {
+                Sec::None
+            };
+            continue;
+        }
+        if let Some((lhs, rhs)) = trim.split_once('=') {
+            match sec {
+                Sec::Strings => {
+                    let k = lhs.trim().to_ascii_lowercase();
+                    let v = rhs.split(';').next().unwrap_or("").trim().trim_matches('"');
+                    strings.insert(k, v.to_string());
+                }
+                Sec::Disks => {
+                    let id = lhs.trim().to_ascii_lowercase();
+                    let fields: Vec<&str> = rhs.split(',').collect();
+                    let path_raw = fields.get(3).copied().unwrap_or("");
+                    disk_paths.insert(id, clean_rel_subpath(path_raw));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Expand any %Token% in disk_paths
+    for val in disk_paths.values_mut() {
+        if val.starts_with('%') && val.ends_with('%') && val.len() > 2 {
+            let key = val[1..val.len() - 1].to_ascii_lowercase();
+            if let Some(sub) = strings.get(&key) {
+                *val = clean_rel_subpath(sub);
+            }
+        }
+    }
+
+    // Pass 2: SourceDisksFiles
+    sec = Sec::None;
+    for line in raw.lines() {
+        let trim = line.trim();
+        if trim.is_empty() || trim.starts_with(';') {
+            continue;
+        }
+        if trim.starts_with('[') && trim.ends_with(']') {
+            let low = trim.to_ascii_lowercase();
+            sec = if low == "[sourcedisksfiles]" || low.starts_with("[sourcedisksfiles.") {
+                Sec::Files
+            } else {
+                Sec::None
+            };
+            continue;
+        }
+        if sec != Sec::Files {
+            continue;
+        }
+        if let Some((lhs, rhs)) = trim.split_once('=') {
+            let fname = lhs.trim().trim_matches('"');
+            if fname.is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = rhs.split(',').collect();
+            let disk_id = fields
+                .first()
+                .copied()
+                .unwrap_or("")
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            let file_sub = fields
+                .get(1)
+                .map(|s| clean_rel_subpath(s))
+                .unwrap_or_default();
+
+            let mut rel = PathBuf::new();
+            if let Some(dp) = disk_paths.get(&disk_id) {
+                if !dp.is_empty() {
+                    rel.push(dp);
+                }
+            }
+            if !file_sub.is_empty() {
+                rel.push(&file_sub);
+            }
+            rel.push(fname);
+
+            let low_name = fname.to_ascii_lowercase();
+            if low_name.ends_with(".sys") || low_name.ends_with(".dll") {
+                if sys_dll_refs.len() < 30 {
+                    sys_dll_refs.push(rel);
+                }
+            } else if other_refs.len() < 15 {
+                other_refs.push(rel);
+            }
+        }
+    }
+
+    if !sys_dll_refs.is_empty() {
+        sys_dll_refs
+    } else {
+        other_refs
+    }
+}
+
+fn payload_exists(base_dir: &Path, rel: &Path) -> bool {
+    let full = base_dir.join(rel);
+    if full.exists() {
+        return true;
+    }
+    // Check compressed Windows INF cabinet naming (e.g. amdkmdag.sy_)
+    if let Some(s) = full.to_str() {
+        if s.len() > 2 {
+            let mut alt = s[..s.len() - 1].to_string();
+            alt.push('_');
+            if Path::new(&alt).exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn collect_candidate_dirs(root: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    out.push(root.to_path_buf());
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let name = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        if name == ".git" || name.contains("ccc2") || name == "msftparse" {
+            continue;
+        }
+        collect_candidate_dirs(&p, depth - 1, out);
+    }
+}
+
+fn stage_inf_into_payload_dir(
+    inf_path: &Path,
+    root_dir: &Path,
+    log: &impl Fn(String),
+) -> Result<PathBuf, String> {
+    let refs = parse_inf_payload_refs(inf_path);
+    if refs.is_empty() {
+        return Ok(inf_path.to_path_buf());
+    }
+
+    let cur_parent = inf_path
+        .parent()
+        .ok_or_else(|| "INF has no parent directory".to_string())?;
+    let cur_hits = refs.iter().filter(|r| payload_exists(cur_parent, r)).count();
+
+    if cur_hits == refs.len() {
+        return Ok(inf_path.to_path_buf());
+    }
+
+    let mut dirs = Vec::new();
+    collect_candidate_dirs(root_dir, 5, &mut dirs);
+
+    let mut best_dir = cur_parent.to_path_buf();
+    let mut best_hits = cur_hits;
+
+    for dir in dirs {
+        let hits = refs.iter().filter(|r| payload_exists(&dir, r)).count();
+        if hits > best_hits {
+            best_hits = hits;
+            best_dir = dir;
+        }
+    }
+
+    if best_hits == 0 {
+        log(format!(
+            "[WARN] Could not locate payload files (e.g. '{}') under {}",
+            refs[0].display(),
+            root_dir.display()
+        ));
+        return Ok(inf_path.to_path_buf());
+    }
+
+    if best_dir != cur_parent {
+        let fname = inf_path
+            .file_name()
+            .ok_or_else(|| "Invalid INF filename".to_string())?;
+        let staged = best_dir.join(fname);
+        fs::copy(inf_path, &staged).map_err(|e| {
+            format!(
+                "Failed staging {} into {}: {}",
+                fname.to_string_lossy(),
+                best_dir.display(),
+                e
+            )
+        })?;
+        log(format!(
+            "[STAGE] Staged {} into payload directory {} ({}/{} sample binaries verified)",
+            fname.to_string_lossy(),
+            best_dir.display(),
+            best_hits,
+            refs.len()
+        ));
+        if best_hits < refs.len() {
+            for missing in refs.iter().filter(|r| !payload_exists(&best_dir, r)).take(5) {
+                log(format!("[WARN] Missing payload file: {}", missing.display()));
+            }
+        }
+        return Ok(staged);
+    }
+
+    Ok(inf_path.to_path_buf())
 }
 
 fn extract_declared_catalogs(inf_path: &Path) -> Vec<String> {
@@ -462,7 +736,6 @@ fn rebuild_and_sign_dir_catalogs(
     cat_names: &[String],
     log: &impl Fn(String),
 ) -> Result<(), String> {
-    // Delete old target catalogs so New-FileCatalog never hashes stale .cat files
     for cat in cat_names {
         let p = dir.join(cat);
         if p.is_dir() {
@@ -472,8 +745,6 @@ fn rebuild_and_sign_dir_catalogs(
         }
     }
 
-    // Use a strictly lowercase temp filename (rbridge_build.cat) so PowerShell New-FileCatalog
-    // never misinterprets an uppercase .CAT extension as a directory path.
     let tmp_dir = env::temp_dir().join("RBridge_Signed_Cats");
     let _ = fs::remove_dir_all(&tmp_dir);
     let _ = fs::create_dir_all(&tmp_dir);
@@ -538,7 +809,7 @@ pub fn run_patch_pipeline(
         return Err("Select a valid AMD 21.Q2.1 or Amernime/R.ID extracted driver folder first.".into());
     }
 
-    let target_infs: Vec<PathBuf> = match (pkg.kind.clone(), selected_inf_idx) {
+    let raw_infs: Vec<PathBuf> = match (pkg.kind.clone(), selected_inf_idx) {
         (DriverPackageKind::AmernimeRid, Some(idx)) => {
             let pick = idx.min(pkg.inf_paths.len() - 1);
             vec![pkg.inf_paths[pick].clone()]
@@ -549,28 +820,32 @@ pub fn run_patch_pipeline(
     log(format!(
         "[INFO] Starting RBridge v2.1 pipeline for: {} ({} target INF)",
         pkg.label,
-        target_infs.len()
+        raw_infs.len()
     ));
 
+    // Heal the entire package tree first so no payload binary is missing for pnputil
+    heal_and_clean_package_tree(&pkg.root_dir, &log);
+
     if opts.strip_amd_bloat {
-        let count = neutralize_standalone_bloat_dirs(&pkg.root_dir, &log);
+        let count = neutralize_ccc2_dirs(&pkg.root_dir, &log);
         if count > 0 {
-            log(format!("[DEBLOAT] Neutralized {} standalone bloat folder(s)", count));
+            log(format!("[DEBLOAT] Neutralized {} Adrenalin UI folder(s)", count));
         }
     }
 
-    let unique_dirs: BTreeSet<PathBuf> = target_infs
-        .iter()
-        .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
-        .collect();
-    for dir in &unique_dirs {
-        heal_and_clean_driver_dir(dir, &log);
+    // Auto-stage MultiParse INFs into the folder containing their real SourceDisksNames binaries
+    let mut staged_infs: Vec<PathBuf> = Vec::with_capacity(raw_infs.len());
+    for inf in &raw_infs {
+        let staged = stage_inf_into_payload_dir(inf, &pkg.root_dir, &log)?;
+        staged_infs.push(staged);
     }
 
     let mut dir_catalogs: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
-    for inf in &target_infs {
+    let mut visited_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    for inf in &staged_infs {
         patch_single_inf(inf, &pkg.kind, opts, &log)?;
         if let Some(parent) = inf.parent() {
+            visited_dirs.insert(parent.to_path_buf());
             let entry = dir_catalogs.entry(parent.to_path_buf()).or_default();
             for cat in extract_declared_catalogs(inf) {
                 if !entry.iter().any(|c| c.eq_ignore_ascii_case(&cat)) {
@@ -582,18 +857,19 @@ pub fn run_patch_pipeline(
 
     for (dir, cats) in &dir_catalogs {
         log(format!(
-            "[CATALOG] Building {} declared catalog(s) in {}",
+            "[CATALOG] Hashing payload & signing {} catalog(s) in {} (may take 10-20s)...",
             cats.len(),
             dir.display()
         ));
         rebuild_and_sign_dir_catalogs(dir, cats, &log)?;
     }
 
+    let mut installed_ok = 0usize;
     if opts.install_driver {
-        for inf in &target_infs {
+        for inf in &staged_infs {
             log(format!(
                 "[INSTALL] pnputil /add-driver {} /install",
-                inf.file_name().unwrap_or_default().to_string_lossy()
+                inf.display()
             ));
             let out = Command::new("pnputil")
                 .args(["/add-driver", &inf.to_string_lossy(), "/install"])
@@ -605,7 +881,9 @@ pub fn run_patch_pipeline(
             for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
                 log(format!("  {}", line.trim()));
             }
-            if !out.status.success() {
+            if out.status.success() {
+                installed_ok += 1;
+            } else {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 if !stderr.trim().is_empty() {
                     log(format!("[WARN] pnputil stderr: {}", stderr.trim()));
@@ -643,5 +921,10 @@ pub fn run_patch_pipeline(
         log(line);
     }
 
-    Ok("Pipeline completed! Reboot Windows to finalize driver & OverDrive settings.".into())
+    let _ = visited_dirs;
+    if opts.install_driver && installed_ok == 0 {
+        Err("Driver installation did not complete cleanly — check [WARN] and pnputil lines above.".into())
+    } else {
+        Ok("Pipeline completed! Reboot Windows to finalize driver & OverDrive settings.".into())
+    }
 }
