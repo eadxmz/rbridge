@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::os::windows::process::CommandExt;
@@ -200,27 +200,6 @@ pub fn detect_driver_package(dir: &Path) -> DetectedPackage {
     }
 }
 
-fn should_strip_inf_line(line_lower: &str) -> bool {
-    const TOKENS: &[&str] = &[
-        "amdrsserv",
-        "radeonsoftware",
-        "atieclxx",
-        "atiesrxx",
-        "amdrssrcext",
-        "amdow.exe",
-        "amddvr.exe",
-        "cncmd.exe",
-        "auepmaster",
-        "aueplauncher",
-        "amduserexperience",
-    ];
-    let trimmed = line_lower.trim_start();
-    if trimmed.starts_with(';') || trimmed.starts_with('[') {
-        return false;
-    }
-    TOKENS.iter().any(|tok| trimmed.contains(tok))
-}
-
 fn neutralize_ccc2_dirs(root: &Path, log: &impl Fn(String)) -> usize {
     let mut stripped = 0usize;
     let mut stack = vec![root.to_path_buf()];
@@ -337,7 +316,6 @@ fn parse_inf_payload_refs(inf_path: &Path) -> Vec<PathBuf> {
         Files,
     }
 
-    // Pass 1: Strings + SourceDisksNames
     let mut sec = Sec::None;
     for line in raw.lines() {
         let trim = line.trim();
@@ -373,7 +351,6 @@ fn parse_inf_payload_refs(inf_path: &Path) -> Vec<PathBuf> {
         }
     }
 
-    // Expand any %Token% in disk_paths
     for val in disk_paths.values_mut() {
         if val.starts_with('%') && val.ends_with('%') && val.len() > 2 {
             let key = val[1..val.len() - 1].to_ascii_lowercase();
@@ -383,7 +360,6 @@ fn parse_inf_payload_refs(inf_path: &Path) -> Vec<PathBuf> {
         }
     }
 
-    // Pass 2: SourceDisksFiles
     sec = Sec::None;
     for line in raw.lines() {
         let trim = line.trim();
@@ -456,7 +432,6 @@ fn payload_exists(base_dir: &Path, rel: &Path) -> bool {
     if full.exists() {
         return true;
     }
-    // Check compressed Windows INF cabinet naming (e.g. amdkmdag.sy_)
     if let Some(s) = full.to_str() {
         if s.len() > 2 {
             let mut alt = s[..s.len() - 1].to_string();
@@ -556,11 +531,6 @@ fn stage_inf_into_payload_dir(
             best_hits,
             refs.len()
         ));
-        if best_hits < refs.len() {
-            for missing in refs.iter().filter(|r| !payload_exists(&best_dir, r)).take(5) {
-                log(format!("[WARN] Missing payload file: {}", missing.display()));
-            }
-        }
         return Ok(staged);
     }
 
@@ -608,37 +578,67 @@ fn extract_declared_catalogs(inf_path: &Path) -> Vec<String> {
     cats
 }
 
+fn is_valid_ddinstall_section(sec: &str) -> bool {
+    if sec.is_empty() {
+        return false;
+    }
+    const BLOCKED_EXACT: &[&str] = &[
+        "version",
+        "strings",
+        "sourcedisksnames",
+        "sourcedisksfiles",
+        "destinationdirs",
+        "manufacturer",
+        "controlflags",
+        "rbridge_tweaks",
+    ];
+    if BLOCKED_EXACT.iter().any(|&b| sec == b) {
+        return false;
+    }
+    const BLOCKED_SUFFIXES: &[&str] = &[
+        ".services",
+        ".hw",
+        ".coinstallers",
+        ".interfaces",
+        ".wmi",
+        ".logconfigoverride",
+        "_inst",
+        "_service_inst",
+    ];
+    !BLOCKED_SUFFIXES.iter().any(|&s| sec.ends_with(s))
+}
+
 fn patch_single_inf(
     inf_path: &Path,
     kind: &DriverPackageKind,
     opts: &PatchOptions,
     log: &impl Fn(String),
 ) -> Result<(), String> {
-    let backup_dir = env::temp_dir().join("RBridge_INF_Backups");
-    let _ = fs::create_dir_all(&backup_dir);
-    let bak_name = format!(
-        "{}.orig",
-        inf_path.file_name().unwrap_or_default().to_string_lossy()
-    );
-    let bak = backup_dir.join(bak_name);
-    if !bak.exists() {
-        let _ = fs::copy(inf_path, &bak);
-    }
-
     let raw = fs::read_to_string(inf_path)
         .map_err(|e| format!("Failed reading {}: {}", inf_path.display(), e))?;
 
     let mut out_lines: Vec<String> = Vec::new();
-    let mut stripped_lines = 0usize;
+    let mut restored_lines = 0usize;
     let mut hook_count = 0usize;
     let mut in_rbridge_section = false;
+    let mut current_sec = String::new();
 
     for line in raw.lines() {
-        let trimmed = line.trim();
+        // Automatically heal any lines commented out by older v2.0/v2.1 bloat stripping
+        // so ServiceBinary / CopyFiles sections are 100% valid for pnputil
+        let effective = if let Some(unstripped) = line.strip_prefix("; [RBridge Stripped] ") {
+            restored_lines += 1;
+            unstripped
+        } else {
+            line
+        };
+
+        let trimmed = effective.trim();
         let lower = trimmed.to_ascii_lowercase();
 
         if lower == "[rbridge_tweaks]" {
             in_rbridge_section = true;
+            current_sec.clear();
             continue;
         }
         if in_rbridge_section {
@@ -648,17 +648,14 @@ fn patch_single_inf(
                 continue;
             }
         }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_sec = trimmed[1..trimmed.len() - 1].trim().to_ascii_lowercase();
+        }
         if lower == "addreg = rbridge_tweaks" {
             continue;
         }
 
-        if opts.strip_amd_bloat && should_strip_inf_line(&lower) {
-            out_lines.push(format!("; [RBridge Stripped] {}", line));
-            stripped_lines += 1;
-            continue;
-        }
-
-        let mut modified = line.to_string();
+        let mut modified = effective.to_string();
         if opts.rebrand_r8_m670 && *kind == DriverPackageKind::AmdPro21Q21 {
             if modified.contains("AMD Radeon HD 8670M") {
                 modified = modified.replace("AMD Radeon HD 8670M", "AMD Radeon R8 M670");
@@ -672,7 +669,7 @@ fn patch_single_inf(
 
         let is_hook_anchor = lower.starts_with("delreg")
             && (lower.contains("ati2mtag") || lower.contains("removedevicesettings"));
-        if is_hook_anchor {
+        if is_hook_anchor && is_valid_ddinstall_section(&current_sec) {
             out_lines.push("AddReg = RBridge_Tweaks".into());
             hook_count += 1;
         }
@@ -680,12 +677,17 @@ fn patch_single_inf(
 
     if hook_count == 0 {
         let mut fallback_lines = Vec::with_capacity(out_lines.len() + 16);
+        let mut sec = String::new();
         for line in out_lines {
-            let lower = line.trim().to_ascii_lowercase();
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                sec = trimmed[1..trimmed.len() - 1].trim().to_ascii_lowercase();
+            }
+            let lower = trimmed.to_ascii_lowercase();
             let inject_after = lower.starts_with("addreg")
                 && (lower.contains("ati2mtag") || lower.contains("kmd_reg"));
             fallback_lines.push(line);
-            if inject_after && hook_count < 4 {
+            if inject_after && is_valid_ddinstall_section(&sec) && hook_count < 4 {
                 fallback_lines.push("AddReg = RBridge_Tweaks".into());
                 hook_count += 1;
             }
@@ -722,11 +724,17 @@ fn patch_single_inf(
     fs::write(inf_path, joined)
         .map_err(|e| format!("Failed writing {}: {}", inf_path.display(), e))?;
 
+    if restored_lines > 0 {
+        log(format!(
+            "[HEAL] Restored {} previously stripped INF line(s) in {} (fixing ServiceBinary/CopyFiles)",
+            restored_lines,
+            inf_path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
     log(format!(
-        "[PATCH] {} -> {} hook(s), {} bloat line(s) stripped",
+        "[PATCH] {} -> {} safe DDInstall hook(s) applied",
         inf_path.file_name().unwrap_or_default().to_string_lossy(),
-        hook_count,
-        stripped_lines
+        hook_count
     ));
     Ok(())
 }
@@ -799,6 +807,23 @@ if ($sig.Status -ne 'Valid') {{ throw "Catalog signature status: $($sig.Status)"
     Ok(())
 }
 
+fn read_setupapi_errors() -> Vec<String> {
+    let Ok(bytes) = fs::read(r"C:\Windows\INF\setupapi.dev.log") else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(120);
+    lines[start..]
+        .iter()
+        .filter(|l| l.contains("!!!") || l.contains("Error 0x"))
+        .rev()
+        .take(8)
+        .rev()
+        .map(|s| format!("  [SetupAPI] {}", s.trim()))
+        .collect()
+}
+
 pub fn run_patch_pipeline(
     pkg: &DetectedPackage,
     opts: &PatchOptions,
@@ -823,7 +848,6 @@ pub fn run_patch_pipeline(
         raw_infs.len()
     ));
 
-    // Heal the entire package tree first so no payload binary is missing for pnputil
     heal_and_clean_package_tree(&pkg.root_dir, &log);
 
     if opts.strip_amd_bloat {
@@ -833,7 +857,6 @@ pub fn run_patch_pipeline(
         }
     }
 
-    // Auto-stage MultiParse INFs into the folder containing their real SourceDisksNames binaries
     let mut staged_infs: Vec<PathBuf> = Vec::with_capacity(raw_infs.len());
     for inf in &raw_infs {
         let staged = stage_inf_into_payload_dir(inf, &pkg.root_dir, &log)?;
@@ -841,11 +864,9 @@ pub fn run_patch_pipeline(
     }
 
     let mut dir_catalogs: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
-    let mut visited_dirs: BTreeSet<PathBuf> = BTreeSet::new();
     for inf in &staged_infs {
         patch_single_inf(inf, &pkg.kind, opts, &log)?;
         if let Some(parent) = inf.parent() {
-            visited_dirs.insert(parent.to_path_buf());
             let entry = dir_catalogs.entry(parent.to_path_buf()).or_default();
             for cat in extract_declared_catalogs(inf) {
                 if !entry.iter().any(|c| c.eq_ignore_ascii_case(&cat)) {
@@ -888,6 +909,9 @@ pub fn run_patch_pipeline(
                 if !stderr.trim().is_empty() {
                     log(format!("[WARN] pnputil stderr: {}", stderr.trim()));
                 }
+                for sa_line in read_setupapi_errors() {
+                    log(sa_line);
+                }
             }
         }
     }
@@ -921,9 +945,8 @@ pub fn run_patch_pipeline(
         log(line);
     }
 
-    let _ = visited_dirs;
     if opts.install_driver && installed_ok == 0 {
-        Err("Driver installation did not complete cleanly — check [WARN] and pnputil lines above.".into())
+        Err("Driver installation did not complete cleanly — check [SetupAPI] / pnputil lines above.".into())
     } else {
         Ok("Pipeline completed! Reboot Windows to finalize driver & OverDrive settings.".into())
     }
