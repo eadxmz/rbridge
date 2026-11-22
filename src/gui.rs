@@ -669,13 +669,61 @@ impl RBridgeApp {
 
         ui.add_space(12.0);
         Self::glass_card().show(ui, |ui| {
-            ui.label(egui::RichText::new("PIPELINE LOG").size(11.0).strong().color(ELECTRIC_CYAN));
-            ui.add_space(4.0);
-            egui::ScrollArea::vertical().max_height(150.0).stick_to_bottom(true).show(ui, |ui| {
-                for line in &self.patch_logs {
-                    ui.label(egui::RichText::new(line).monospace().size(11.5).color(TEXT_PRIMARY));
-                }
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("PIPELINE LOG").size(11.0).strong().color(ELECTRIC_CYAN));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(Self::pill_secondary("Clear").min_size(egui::vec2(64.0, 26.0)))
+                        .clicked()
+                    {
+                        self.patch_logs.clear();
+                        self.set_status("Cleared pipeline log.", false);
+                    }
+                    if ui
+                        .add(Self::pill_secondary("Export .txt").min_size(egui::vec2(96.0, 26.0)))
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_file_name("rbridge_pipeline_log.txt")
+                            .add_filter("Text Log", &["txt"])
+                            .save_file()
+                        {
+                            let body = self.patch_logs.join("\r\n");
+                            match std::fs::write(&path, body) {
+                                Ok(_) => self.set_status(
+                                    format!("Exported log to {}", path.display()),
+                                    false,
+                                ),
+                                Err(e) => self.set_status(format!("Export failed: {}", e), true),
+                            }
+                        }
+                    }
+                    if ui
+                        .add(Self::pill_primary("Copy Log").min_size(egui::vec2(92.0, 26.0)))
+                        .clicked()
+                    {
+                        let body = self.patch_logs.join("\r\n");
+                        ui.ctx().copy_text(body);
+                        self.set_status(
+                            format!("Copied {} log line(s) to clipboard.", self.patch_logs.len()),
+                            false,
+                        );
+                    }
+                });
             });
+            ui.add_space(6.0);
+            let mut log_text = self.patch_logs.join("\n");
+            egui::ScrollArea::vertical()
+                .max_height(180.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut log_text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(9),
+                    );
+                });
         });
     }
 

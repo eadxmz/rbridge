@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -157,7 +159,7 @@ fn should_strip_inf_line(line_lower: &str) -> bool {
     TOKENS.iter().any(|tok| trimmed.contains(tok))
 }
 
-fn neutralize_package_bloat_files(root: &Path, log: &impl Fn(String)) -> usize {
+fn neutralize_standalone_bloat_dirs(root: &Path, log: &impl Fn(String)) -> usize {
     let mut stripped = 0usize;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -166,34 +168,107 @@ fn neutralize_package_bloat_files(root: &Path, log: &impl Fn(String)) -> usize {
         };
         for entry in entries.flatten() {
             let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
             let name = p
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_ascii_lowercase();
-            if p.is_dir() {
-                if name.contains("ccc2_install") || name.contains("amdfendr") {
-                    let renamed = p.with_extension("rbridge_stripped");
-                    if fs::rename(&p, &renamed).is_ok() {
-                        stripped += 1;
-                        log(format!("[DEBLOAT] Neutralized bloat folder '{}'", name));
-                    }
-                } else {
-                    stack.push(p);
-                }
-            } else if debloat::BLOAT_PROCESSES
-                .iter()
-                .any(|b| b.eq_ignore_ascii_case(&name))
-            {
-                let renamed = p.with_extension("exe.rbridge_stripped");
+            if name.contains("ccc2_install") || name == "amdfendr" {
+                let renamed = p.with_extension("rbridge_stripped");
                 if fs::rename(&p, &renamed).is_ok() {
                     stripped += 1;
-                    log(format!("[DEBLOAT] Stripped package binary '{}'", name));
+                    log(format!("[DEBLOAT] Neutralized standalone bloat folder '{}'", name));
                 }
+            } else {
+                stack.push(p);
             }
         }
     }
     stripped
+}
+
+fn heal_and_clean_driver_dir(dir: &Path, log: &impl Fn(String)) {
+    let backup_dir = env::temp_dir().join("RBridge_INF_Backups");
+    let _ = fs::create_dir_all(&backup_dir);
+
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&cur) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let lower = name.to_ascii_lowercase();
+
+            // Move any old in-place .rbridge_bak backups out so they never pollute the catalog
+            if lower.ends_with(".rbridge_bak") {
+                let dst = backup_dir.join(&name);
+                if fs::copy(&p, &dst).is_ok() {
+                    let _ = fs::remove_file(&p);
+                }
+            } else if lower.ends_with(".exe.rbridge_stripped") {
+                // Restore binaries renamed by older v2.1 builds so pnputil CopyFiles never misses files
+                let restored_name = &name[..name.len() - ".rbridge_stripped".len()];
+                let dst = cur.join(restored_name);
+                if fs::rename(&p, &dst).is_ok() {
+                    log(format!("[CLEAN] Restored '{}' for clean catalog hashing", restored_name));
+                }
+            }
+        }
+    }
+}
+
+fn extract_declared_catalogs(inf_path: &Path) -> Vec<String> {
+    let mut cats = Vec::new();
+    if let Ok(raw) = fs::read_to_string(inf_path) {
+        let mut in_version = false;
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                in_version = trimmed.eq_ignore_ascii_case("[version]");
+                continue;
+            }
+            if !in_version || trimmed.starts_with(';') {
+                continue;
+            }
+            if let Some((lhs, rhs)) = trimmed.split_once('=') {
+                let key = lhs.trim().to_ascii_lowercase();
+                if key == "catalogfile" || key.starts_with("catalogfile.") {
+                    let val = rhs
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .trim_matches('"');
+                    if !val.is_empty() && !cats.iter().any(|c: &String| c.eq_ignore_ascii_case(val))
+                    {
+                        cats.push(val.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if cats.is_empty() {
+        let stem = inf_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        cats.push(format!("{}.cat", stem));
+    }
+    cats
 }
 
 fn patch_single_inf(
@@ -202,7 +277,13 @@ fn patch_single_inf(
     opts: &PatchOptions,
     log: &impl Fn(String),
 ) -> Result<(), String> {
-    let bak = inf_path.with_extension("inf.rbridge_bak");
+    let backup_dir = env::temp_dir().join("RBridge_INF_Backups");
+    let _ = fs::create_dir_all(&backup_dir);
+    let bak_name = format!(
+        "{}.orig",
+        inf_path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    let bak = backup_dir.join(bak_name);
     if !bak.exists() {
         let _ = fs::copy(inf_path, &bak);
     }
@@ -219,7 +300,6 @@ fn patch_single_inf(
         let trimmed = line.trim();
         let lower = trimmed.to_ascii_lowercase();
 
-        // Remove any old RBridge section on re-patch
         if lower == "[rbridge_tweaks]" {
             in_rbridge_section = true;
             continue;
@@ -242,8 +322,6 @@ fn patch_single_inf(
         }
 
         let mut modified = line.to_string();
-
-        // Optional clean branding on 21.Q2.1 (never overwrite R.ID's custom PCI strings unless checked)
         if opts.rebrand_r8_m670 && *kind == DriverPackageKind::AmdPro21Q21 {
             if modified.contains("AMD Radeon HD 8670M") {
                 modified = modified.replace("AMD Radeon HD 8670M", "AMD Radeon R8 M670");
@@ -255,7 +333,6 @@ fn patch_single_inf(
 
         out_lines.push(modified);
 
-        // Inject our AddReg hook right after DelReg or main CopyFiles in AMD install blocks
         let is_hook_anchor = lower.starts_with("delreg")
             && (lower.contains("ati2mtag") || lower.contains("removedevicesettings"));
         if is_hook_anchor {
@@ -264,7 +341,6 @@ fn patch_single_inf(
         }
     }
 
-    // Fallback hook for Amernime/R.ID INFs that already removed DelReg
     if hook_count == 0 {
         let mut fallback_lines = Vec::with_capacity(out_lines.len() + 16);
         for line in out_lines {
@@ -297,7 +373,6 @@ fn patch_single_inf(
     ));
 
     if *kind == DriverPackageKind::AmdPro21Q21 {
-        // Legacy UMD optimizations safe for 21.Q2.1 (skipped on R.ID DXNAVI to avoid shader glitches)
         out_lines.push("HKR, UMD, OGL_ThreadControl, 0x00010001, 1".into());
         out_lines.push("HKR, UMD, Tessellation_OPTION, 0x00000000, \"2\"".into());
         out_lines.push("HKR, UMD, Tessellation, 0x00000000, \"4\"".into());
@@ -310,7 +385,7 @@ fn patch_single_inf(
         .map_err(|e| format!("Failed writing {}: {}", inf_path.display(), e))?;
 
     log(format!(
-        "[PATCH] {} -> {} AddReg hook(s), {} bloat line(s) stripped",
+        "[PATCH] {} -> {} hook(s), {} bloat line(s) stripped",
         inf_path.file_name().unwrap_or_default().to_string_lossy(),
         hook_count,
         stripped_lines
@@ -318,52 +393,77 @@ fn patch_single_inf(
     Ok(())
 }
 
-fn sign_catalog_zero_wdk(inf_path: &Path, log: &impl Fn(String)) -> Result<(), String> {
-    let dir = inf_path.parent().ok_or("INF has no parent directory")?;
-    let stem = inf_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let cat_path = dir.join(format!("{}.cat", stem));
+fn rebuild_and_sign_dir_catalogs(
+    dir: &Path,
+    cat_names: &[String],
+    log: &impl Fn(String),
+) -> Result<(), String> {
+    // Delete all stale target catalogs first so New-FileCatalog never hashes old .cat files
+    for cat in cat_names {
+        let p = dir.join(cat);
+        if p.exists() {
+            let _ = fs::remove_file(&p);
+        }
+    }
 
+    let tmp_dir = env::temp_dir().join("RBridge_Signed_Cats");
+    let _ = fs::create_dir_all(&tmp_dir);
     let dir_s = dir.to_string_lossy().replace('\'', "''");
-    let cat_s = cat_path.to_string_lossy().replace('\'', "''");
 
-    let ps = format!(
-        r#"$ErrorActionPreference = 'Stop'
+    let mut staged: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+
+    for cat in cat_names {
+        let tmp_cat = tmp_dir.join(cat);
+        if tmp_cat.exists() {
+            let _ = fs::remove_file(&tmp_cat);
+        }
+        let tmp_cat_s = tmp_cat.to_string_lossy().replace('\'', "''");
+
+        let ps = format!(
+            r#"$ErrorActionPreference = 'Stop'
 $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object {{ $_.Subject -eq 'CN=RBridge Driver Signing' }} | Select-Object -First 1
 if (-not $cert) {{
   $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=RBridge Driver Signing' -CertStoreLocation 'Cert:\LocalMachine\My' -NotAfter (Get-Date).AddYears(10)
+}}
+if (-not (Get-ChildItem Cert:\LocalMachine\TrustedPublisher | Where-Object {{ $_.Thumbprint -eq $cert.Thumbprint }})) {{
   $cerPath = Join-Path $env:TEMP 'rbridge_sign.cer'
   Export-Certificate -Cert $cert -FilePath $cerPath -Force | Out-Null
   Import-Certificate -FilePath $cerPath -CertStoreLocation 'Cert:\LocalMachine\Root' | Out-Null
   Import-Certificate -FilePath $cerPath -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
 }}
-New-FileCatalog -Path '{dir}' -CatalogFilePath '{cat}' -CatalogVersion 2.0 | Out-Null
-Set-AuthenticodeSignature -FilePath '{cat}' -Certificate $cert | Out-Null"#,
-        dir = dir_s,
-        cat = cat_s
-    );
+New-FileCatalog -Path '{dir}' -CatalogFilePath '{tmp_cat}' -CatalogVersion 2.0 | Out-Null
+$sig = Set-AuthenticodeSignature -FilePath '{tmp_cat}' -Certificate $cert -HashAlgorithm SHA256
+if ($sig.Status -ne 'Valid') {{ throw "Catalog signature status: $($sig.Status)" }}"#,
+            dir = dir_s,
+            tmp_cat = tmp_cat_s
+        );
 
-    let out = Command::new("powershell")
-        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("Failed executing PowerShell signing: {}", e))?;
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("Failed executing PowerShell signing: {}", e))?;
 
-    if out.status.success() {
-        log(format!(
-            "[SIGN] Rebuilt & signed {} (Zero-WDK local trust)",
-            cat_path.file_name().unwrap_or_default().to_string_lossy()
-        ));
-        Ok(())
-    } else {
-        Err(format!(
-            "Catalog signing failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
+        if !out.status.success() {
+            return Err(format!(
+                "Catalog signing failed for {}: {}",
+                cat,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+
+        staged.push((tmp_cat, dir.join(cat), cat.clone()));
     }
+
+    // Move all freshly signed catalogs into the driver directory together
+    for (src, dst, name) in staged {
+        fs::copy(&src, &dst)
+            .map_err(|e| format!("Failed placing signed catalog {}: {}", name, e))?;
+        let _ = fs::remove_file(&src);
+        log(format!("[SIGN] Rebuilt & SHA-256 signed declared catalog '{}'", name));
+    }
+
+    Ok(())
 }
 
 pub fn run_patch_pipeline(
@@ -375,26 +475,58 @@ pub fn run_patch_pipeline(
         return Err("Select a valid AMD 21.Q2.1 or Amernime/R.ID extracted driver folder first.".into());
     }
 
-    log(format!("[INFO] Starting RBridge v2.0 pipeline for: {}", pkg.label));
+    log(format!("[INFO] Starting RBridge v2.1 pipeline for: {}", pkg.label));
 
     if opts.strip_amd_bloat {
-        let count = neutralize_package_bloat_files(&pkg.root_dir, &log);
-        log(format!("[DEBLOAT] Neutralized {} bloat binary/folder(s) in package", count));
+        let count = neutralize_standalone_bloat_dirs(&pkg.root_dir, &log);
+        if count > 0 {
+            log(format!("[DEBLOAT] Neutralized {} standalone bloat folder(s)", count));
+        }
     }
 
+    // Clean any old .rbridge_bak or v2.1 .exe.rbridge_stripped files before patching & hashing
+    let unique_dirs: BTreeSet<PathBuf> = pkg
+        .inf_paths
+        .iter()
+        .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
+        .collect();
+    for dir in &unique_dirs {
+        heal_and_clean_driver_dir(dir, &log);
+    }
+
+    // Step 1: Patch ALL INFs BEFORE generating any catalogs
+    let mut dir_catalogs: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
     for inf in &pkg.inf_paths {
         patch_single_inf(inf, &pkg.kind, opts, &log)?;
-        sign_catalog_zero_wdk(inf, &log)?;
+        if let Some(parent) = inf.parent() {
+            let entry = dir_catalogs.entry(parent.to_path_buf()).or_default();
+            for cat in extract_declared_catalogs(inf) {
+                if !entry.iter().any(|c| c.eq_ignore_ascii_case(&cat)) {
+                    entry.push(cat);
+                }
+            }
+        }
+    }
+
+    // Step 2: Rebuild & sign each unique declared CatalogFile per directory
+    for (dir, cats) in &dir_catalogs {
+        log(format!(
+            "[CATALOG] Building {} declared catalog(s) in {}",
+            cats.len(),
+            dir.display()
+        ));
+        rebuild_and_sign_dir_catalogs(dir, cats, &log)?;
     }
 
     if pkg.kind == DriverPackageKind::AmernimeRid {
-        log("[NOTE] Amernime/R.ID uses modified .sys/.dll binaries: ensure R.ID's certificate or Windows Test Mode is active if pnputil reports Code 52.".into());
+        log("[NOTE] Amernime/R.ID modifies kernel binaries; if Windows rejects signature trust (Code 52), enable Test Mode (bcdedit /set testsigning on) or install R.ID's cert.".into());
     }
 
+    // Step 3: Install via pnputil
     if opts.install_driver {
         for inf in &pkg.inf_paths {
             log(format!(
-                "[INSTALL] Installing {} via pnputil...",
+                "[INSTALL] pnputil /add-driver {} /install",
                 inf.file_name().unwrap_or_default().to_string_lossy()
             ));
             let out = Command::new("pnputil")
@@ -430,13 +562,13 @@ pub fn run_patch_pipeline(
             Err(e) => log(format!("[WARN] GUI install skipped: {}", e)),
         }
     } else {
-        log("[INFO] Driver-Only mode selected — RBridge GUI was not installed to Program Files.".into());
+        log("[INFO] Driver-Only mode selected — RBridge GUI not installed.".into());
     }
 
     if opts.install_boot_guard {
         match tweaks::install_boot_guard() {
             Ok(msg) => log(format!("[DAEMON] {}", msg)),
-            Err(e) => log(format!("[WARN] Boot Guard setup warning: {}", e)),
+            Err(e) => log(format!("[WARN] Boot Guard warning: {}", e)),
         }
     }
 
