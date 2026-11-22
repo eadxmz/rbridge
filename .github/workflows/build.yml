@@ -1,22 +1,22 @@
-name: Build RBridge
+name: Build RBridge v2.0
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build release binaries
-        run: cargo build --release
-      - name: Upload RBridge artifacts
-        uses: actions/upload-artifact@v7
         with:
-          name: rbridge-win64
-          path: |
-            target/release/rbridge.exe
-            target/release/rbridge-daemon.exe
+          targets: x86_64-pc-windows-msvc
+      - name: Build single bundled rbridge.exe
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Upload RBridge v2.0 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rbridge-v2-windows-x64
+          path: target/x86_64-pc-windows-msvc/release/rbridge.exe
