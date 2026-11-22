@@ -55,6 +55,7 @@ struct RBridgeApp {
     // Driver Patcher
     pkg_dir: String,
     detected_pkg: Option<DetectedPackage>,
+    selected_inf_idx: usize,
     patch_opts: PatchOptions,
     patch_logs: Vec<String>,
     worker_rx: Option<Receiver<WorkerMsg>>,
@@ -124,6 +125,7 @@ impl RBridgeApp {
             tweaks: tweaks::read_tweak_state(),
             pkg_dir: String::new(),
             detected_pkg: None,
+            selected_inf_idx: 0,
             patch_opts: PatchOptions::default(),
             patch_logs: vec!["Select an extracted AMD 21.Q2.1 or Amernime / R.ID 23.9.1 iCafe folder.".into()],
             worker_rx: None,
@@ -583,14 +585,17 @@ impl RBridgeApp {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                         self.pkg_dir = folder.to_string_lossy().into_owned();
                         self.detected_pkg = Some(patcher::detect_driver_package(&folder));
+                        self.selected_inf_idx = 0;
                     }
                 }
                 if ui.add(Self::pill_secondary("Scan")).clicked() && !self.pkg_dir.trim().is_empty() {
                     let p = PathBuf::from(self.pkg_dir.trim());
                     self.detected_pkg = Some(patcher::detect_driver_package(&p));
+                    self.selected_inf_idx = 0;
                 }
             });
 
+            let mut rid_inf_names: Option<Vec<String>> = None;
             if let Some(pkg) = &self.detected_pkg {
                 ui.add_space(8.0);
                 let ok = pkg.kind != DriverPackageKind::Unknown;
@@ -600,6 +605,32 @@ impl RBridgeApp {
                     if ok { egui::Color32::from_rgb(16, 65, 52) } else { egui::Color32::from_rgb(76, 22, 28) },
                     if ok { MINT_OK } else { CORAL_ERR },
                 );
+                if pkg.kind == DriverPackageKind::AmernimeRid && !pkg.inf_paths.is_empty() {
+                    rid_inf_names = Some(
+                        pkg.inf_paths
+                            .iter()
+                            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                            .collect(),
+                    );
+                }
+            }
+            if let Some(names) = rid_inf_names {
+                if self.selected_inf_idx >= names.len() {
+                    self.selected_inf_idx = 0;
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Target INF Profile:").strong().color(TEXT_PRIMARY));
+                    egui::ComboBox::from_id_salt("rid_inf_picker")
+                        .width(340.0)
+                        .selected_text(&names[self.selected_inf_idx])
+                        .show_ui(ui, |ui| {
+                            for (idx, name) in names.iter().enumerate() {
+                                ui.selectable_value(&mut self.selected_inf_idx, idx, name);
+                            }
+                        });
+                    ui.label(egui::RichText::new("(gcnstd = Consumer OverDrive)").size(11.5).color(ELECTRIC_CYAN));
+                });
             }
         });
 
@@ -652,13 +683,18 @@ impl RBridgeApp {
             if ui.add_enabled(can_run, Self::pill_primary("Patch, Sign & Install")).clicked() {
                 if let Some(pkg) = self.detected_pkg.clone() {
                     let opts = self.patch_opts.clone();
+                    let sel_idx = if pkg.kind == DriverPackageKind::AmernimeRid {
+                        Some(self.selected_inf_idx)
+                    } else {
+                        None
+                    };
                     let (tx, rx) = mpsc::channel();
                     self.worker_rx = Some(rx);
                     self.busy = true;
                     self.patch_logs.clear();
                     self.set_status("Running RBridge driver pipeline...", false);
                     thread::spawn(move || {
-                        let res = patcher::run_patch_pipeline(&pkg, &opts, |line| {
+                        let res = patcher::run_patch_pipeline(&pkg, &opts, sel_idx, |line| {
                             let _ = tx.send(WorkerMsg::Log(line));
                         });
                         let _ = tx.send(WorkerMsg::Done(res));

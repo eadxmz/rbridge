@@ -4,6 +4,8 @@ use std::fs;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use winreg::enums::*;
+use winreg::RegKey;
 
 use crate::debloat;
 use crate::tweaks;
@@ -48,6 +50,23 @@ impl Default for PatchOptions {
     }
 }
 
+fn detect_local_amd_dev_id() -> Option<String> {
+    let amd_path = tweaks::find_amd_class_subkey()?;
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let k = hklm.open_subkey_with_flags(&amd_path, KEY_READ).ok()?;
+    let match_id = k
+        .get_value::<String, _>("MatchingDeviceId")
+        .ok()?
+        .to_ascii_lowercase();
+    let pos = match_id.find("dev_")?;
+    let tail = &match_id[pos..];
+    if tail.len() >= 8 {
+        Some(tail[..8].to_string())
+    } else {
+        None
+    }
+}
+
 fn collect_infs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth == 0 {
         return;
@@ -63,7 +82,7 @@ fn collect_infs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_ascii_lowercase();
-            if name.contains("ccc2") || name == ".git" {
+            if name.contains("ccc2") || name == ".git" || name == "msftparse" {
                 continue;
             }
             collect_infs(&p, depth - 1, out);
@@ -77,12 +96,32 @@ fn collect_infs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+fn rid_priority(path: &Path) -> (u8, String) {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let tier = if name.contains("gcnstd") {
+        0 // Consumer GCN Standard (native OverDrive)
+    } else if name.contains("gcnflexdgpu") {
+        1 // GCN Flexible dGPU
+    } else if name.contains("gcnpro") {
+        2 // GCN Pro Workstation
+    } else {
+        3
+    };
+    (tier, name)
+}
+
 pub fn detect_driver_package(dir: &Path) -> DetectedPackage {
     let mut all_infs = Vec::new();
     collect_infs(dir, 6, &mut all_infs);
 
+    let local_dev = detect_local_amd_dev_id();
     let mut pro_infs = Vec::new();
-    let mut rid_infs = Vec::new();
+    let mut rid_matched = Vec::new();
+    let mut rid_all = Vec::new();
 
     for inf in &all_infs {
         let fname = inf
@@ -90,16 +129,24 @@ pub fn detect_driver_package(dir: &Path) -> DetectedPackage {
             .unwrap_or_default()
             .to_string_lossy()
             .to_ascii_lowercase();
+        if fname.contains("_msft") {
+            continue;
+        }
         if fname == "u0366524.inf" || fname == "u0369543.inf" {
             pro_infs.push(inf.clone());
             continue;
         }
         if let Ok(text) = fs::read_to_string(inf) {
-            let upper = text.to_ascii_uppercase();
-            let is_amd_display = upper.contains("VEN_1002")
-                && (upper.contains("AMDKMDAG") || upper.contains("ATI2MTAG"));
+            let lower = text.to_ascii_lowercase();
+            let is_amd_display = lower.contains("ven_1002")
+                && (lower.contains("amdkmdag") || lower.contains("ati2mtag"));
             if is_amd_display {
-                rid_infs.push(inf.clone());
+                rid_all.push(inf.clone());
+                if let Some(ref dev) = local_dev {
+                    if lower.contains(dev) {
+                        rid_matched.push(inf.clone());
+                    }
+                }
             }
         }
     }
@@ -116,14 +163,32 @@ pub fn detect_driver_package(dir: &Path) -> DetectedPackage {
         };
     }
 
-    if !rid_infs.is_empty() {
+    let mut chosen = if !rid_matched.is_empty() {
+        rid_matched
+    } else {
+        rid_all
+    };
+
+    if !chosen.is_empty() {
+        // Sort by preferred tier (gcnstd -> gcnflexdgpu -> gcnpro), newest build number first
+        chosen.sort_by(|a, b| {
+            let (ta, na) = rid_priority(a);
+            let (tb, nb) = rid_priority(b);
+            ta.cmp(&tb).then_with(|| nb.cmp(&na))
+        });
+
+        let dev_note = local_dev
+            .as_deref()
+            .map(|d| format!(" matching {}", d.to_ascii_uppercase()))
+            .unwrap_or_default();
         return DetectedPackage {
             kind: DriverPackageKind::AmernimeRid,
             label: format!(
-                "Amernime Zone / R.ID Hybrid Driver ({} INF file(s) detected)",
-                rid_infs.len()
+                "Amernime / R.ID Hybrid ({} compatible INF(s){})",
+                chosen.len(),
+                dev_note
             ),
-            inf_paths: rid_infs,
+            inf_paths: chosen,
             root_dir: dir.to_path_buf(),
         };
     }
@@ -212,14 +277,12 @@ fn heal_and_clean_driver_dir(dir: &Path, log: &impl Fn(String)) {
                 .to_string();
             let lower = name.to_ascii_lowercase();
 
-            // Move any old in-place .rbridge_bak backups out so they never pollute the catalog
             if lower.ends_with(".rbridge_bak") {
                 let dst = backup_dir.join(&name);
                 if fs::copy(&p, &dst).is_ok() {
                     let _ = fs::remove_file(&p);
                 }
             } else if lower.ends_with(".exe.rbridge_stripped") {
-                // Restore binaries renamed by older v2.1 builds so pnputil CopyFiles never misses files
                 let restored_name = &name[..name.len() - ".rbridge_stripped".len()];
                 let dst = cur.join(restored_name);
                 if fs::rename(&p, &dst).is_ok() {
@@ -367,6 +430,7 @@ fn patch_single_inf(
     out_lines.push("HKR,, KMD_EnableInternalLargePage, 0x00010001, 2".into());
     out_lines.push("HKR,, PP_SclkDeepSleepDisable, 0x00010001, 1".into());
     out_lines.push("HKR,, PP_ThermalAutoThrottlingEnable, 0x00010001, 0".into());
+    out_lines.push("HKR,, PP_EnableOverdrive, 0x00010001, 1".into());
     out_lines.push(format!(
         "HKR, \"Interrupt Management\\MessageSignaledInterruptProperties\", MSISupported, 0x00010001, {}",
         msi_val
@@ -398,29 +462,28 @@ fn rebuild_and_sign_dir_catalogs(
     cat_names: &[String],
     log: &impl Fn(String),
 ) -> Result<(), String> {
-    // Delete all stale target catalogs first so New-FileCatalog never hashes old .cat files
+    // Delete old target catalogs so New-FileCatalog never hashes stale .cat files
     for cat in cat_names {
         let p = dir.join(cat);
-        if p.exists() {
+        if p.is_dir() {
+            let _ = fs::remove_dir_all(&p);
+        } else if p.exists() {
             let _ = fs::remove_file(&p);
         }
     }
 
+    // Use a strictly lowercase temp filename (rbridge_build.cat) so PowerShell New-FileCatalog
+    // never misinterprets an uppercase .CAT extension as a directory path.
     let tmp_dir = env::temp_dir().join("RBridge_Signed_Cats");
+    let _ = fs::remove_dir_all(&tmp_dir);
     let _ = fs::create_dir_all(&tmp_dir);
+    let tmp_cat = tmp_dir.join("rbridge_build.cat");
+
     let dir_s = dir.to_string_lossy().replace('\'', "''");
+    let tmp_cat_s = tmp_cat.to_string_lossy().replace('\'', "''");
 
-    let mut staged: Vec<(PathBuf, PathBuf, String)> = Vec::new();
-
-    for cat in cat_names {
-        let tmp_cat = tmp_dir.join(cat);
-        if tmp_cat.exists() {
-            let _ = fs::remove_file(&tmp_cat);
-        }
-        let tmp_cat_s = tmp_cat.to_string_lossy().replace('\'', "''");
-
-        let ps = format!(
-            r#"$ErrorActionPreference = 'Stop'
+    let ps = format!(
+        r#"$ErrorActionPreference = 'Stop'
 $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object {{ $_.Subject -eq 'CN=RBridge Driver Signing' }} | Select-Object -First 1
 if (-not $cert) {{
   $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=RBridge Driver Signing' -CertStoreLocation 'Cert:\LocalMachine\My' -NotAfter (Get-Date).AddYears(10)
@@ -432,50 +495,62 @@ if (-not (Get-ChildItem Cert:\LocalMachine\TrustedPublisher | Where-Object {{ $_
   Import-Certificate -FilePath $cerPath -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
 }}
 New-FileCatalog -Path '{dir}' -CatalogFilePath '{tmp_cat}' -CatalogVersion 2.0 | Out-Null
+if (-not (Test-Path -LiteralPath '{tmp_cat}' -PathType Leaf)) {{
+  throw "New-FileCatalog did not emit a catalog file at {tmp_cat}"
+}}
 $sig = Set-AuthenticodeSignature -FilePath '{tmp_cat}' -Certificate $cert -HashAlgorithm SHA256
 if ($sig.Status -ne 'Valid') {{ throw "Catalog signature status: $($sig.Status)" }}"#,
-            dir = dir_s,
-            tmp_cat = tmp_cat_s
-        );
+        dir = dir_s,
+        tmp_cat = tmp_cat_s
+    );
 
-        let out = Command::new("powershell")
-            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .map_err(|e| format!("Failed executing PowerShell signing: {}", e))?;
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("Failed executing PowerShell signing: {}", e))?;
 
-        if !out.status.success() {
-            return Err(format!(
-                "Catalog signing failed for {}: {}",
-                cat,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-
-        staged.push((tmp_cat, dir.join(cat), cat.clone()));
+    if !out.status.success() {
+        return Err(format!(
+            "Catalog signing failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
 
-    // Move all freshly signed catalogs into the driver directory together
-    for (src, dst, name) in staged {
-        fs::copy(&src, &dst)
-            .map_err(|e| format!("Failed placing signed catalog {}: {}", name, e))?;
-        let _ = fs::remove_file(&src);
-        log(format!("[SIGN] Rebuilt & SHA-256 signed declared catalog '{}'", name));
+    for cat in cat_names {
+        let dst = dir.join(cat);
+        fs::copy(&tmp_cat, &dst)
+            .map_err(|e| format!("Failed placing signed catalog {}: {}", cat, e))?;
+        log(format!("[SIGN] Rebuilt & SHA-256 signed declared catalog '{}'", cat));
     }
 
+    let _ = fs::remove_dir_all(&tmp_dir);
     Ok(())
 }
 
 pub fn run_patch_pipeline(
     pkg: &DetectedPackage,
     opts: &PatchOptions,
+    selected_inf_idx: Option<usize>,
     log: impl Fn(String),
 ) -> Result<String, String> {
     if pkg.kind == DriverPackageKind::Unknown || pkg.inf_paths.is_empty() {
         return Err("Select a valid AMD 21.Q2.1 or Amernime/R.ID extracted driver folder first.".into());
     }
 
-    log(format!("[INFO] Starting RBridge v2.1 pipeline for: {}", pkg.label));
+    let target_infs: Vec<PathBuf> = match (pkg.kind.clone(), selected_inf_idx) {
+        (DriverPackageKind::AmernimeRid, Some(idx)) => {
+            let pick = idx.min(pkg.inf_paths.len() - 1);
+            vec![pkg.inf_paths[pick].clone()]
+        }
+        _ => pkg.inf_paths.clone(),
+    };
+
+    log(format!(
+        "[INFO] Starting RBridge v2.1 pipeline for: {} ({} target INF)",
+        pkg.label,
+        target_infs.len()
+    ));
 
     if opts.strip_amd_bloat {
         let count = neutralize_standalone_bloat_dirs(&pkg.root_dir, &log);
@@ -484,9 +559,7 @@ pub fn run_patch_pipeline(
         }
     }
 
-    // Clean any old .rbridge_bak or v2.1 .exe.rbridge_stripped files before patching & hashing
-    let unique_dirs: BTreeSet<PathBuf> = pkg
-        .inf_paths
+    let unique_dirs: BTreeSet<PathBuf> = target_infs
         .iter()
         .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
         .collect();
@@ -494,9 +567,8 @@ pub fn run_patch_pipeline(
         heal_and_clean_driver_dir(dir, &log);
     }
 
-    // Step 1: Patch ALL INFs BEFORE generating any catalogs
     let mut dir_catalogs: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
-    for inf in &pkg.inf_paths {
+    for inf in &target_infs {
         patch_single_inf(inf, &pkg.kind, opts, &log)?;
         if let Some(parent) = inf.parent() {
             let entry = dir_catalogs.entry(parent.to_path_buf()).or_default();
@@ -508,7 +580,6 @@ pub fn run_patch_pipeline(
         }
     }
 
-    // Step 2: Rebuild & sign each unique declared CatalogFile per directory
     for (dir, cats) in &dir_catalogs {
         log(format!(
             "[CATALOG] Building {} declared catalog(s) in {}",
@@ -518,13 +589,8 @@ pub fn run_patch_pipeline(
         rebuild_and_sign_dir_catalogs(dir, cats, &log)?;
     }
 
-    if pkg.kind == DriverPackageKind::AmernimeRid {
-        log("[NOTE] Amernime/R.ID modifies kernel binaries; if Windows rejects signature trust (Code 52), enable Test Mode (bcdedit /set testsigning on) or install R.ID's cert.".into());
-    }
-
-    // Step 3: Install via pnputil
     if opts.install_driver {
-        for inf in &pkg.inf_paths {
+        for inf in &target_infs {
             log(format!(
                 "[INSTALL] pnputil /add-driver {} /install",
                 inf.file_name().unwrap_or_default().to_string_lossy()
@@ -577,5 +643,5 @@ pub fn run_patch_pipeline(
         log(line);
     }
 
-    Ok("Pipeline completed! Reboot Windows to finalize driver & MSI settings.".into())
+    Ok("Pipeline completed! Reboot Windows to finalize driver & OverDrive settings.".into())
 }
