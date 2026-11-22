@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0E172A"/>
+      <stop offset="55%" stop-color="#0B2447"/>
+      <stop offset="100%" stop-color="#071120"/>
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="50%" stop-color="#147CE8"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="30%" cy="22%" r="65%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.32"/>
+      <stop offset="100%" stop-color="#0E172A" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="12" y="12" width="232" height="232" rx="54" fill="url(#bgGrad)" stroke="#1E3A5F" stroke-width="5"/>
+  <rect x="12" y="12" width="232" height="232" rx="54" fill="url(#glow)"/>
+  <!-- Bridge Arch -->
+  <path d="M 46 184 Q 128 118 210 184" fill="none" stroke="url(#accentGrad)" stroke-width="14" stroke-linecap="round"/>
+  <!-- Stylized R Pillar & Loop -->
+  <path d="M 74 176 L 74 72 L 136 72 C 166 72 182 88 182 110 C 182 132 164 146 136 146 L 96 146" fill="none" stroke="#F1F5F9" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 134 146 L 184 190" fill="none" stroke="url(#accentGrad)" stroke-width="18" stroke-linecap="round"/>
+  <!-- Silicon Nodes -->
+  <circle cx="74" cy="72" r="9" fill="#38BDF8"/>
+  <circle cx="184" cy="190" r="9" fill="#38BDF8"/>
+</svg>

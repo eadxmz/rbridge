@@ -396,4 +396,5 @@ pub fn run_boot_guard_daemon() {
     }
     let _ = apply_tweaks(&cfg);
     let _ = debloat::strip_live_bloat();
+    crate::powerplay::apply_saved_live_oc();
 }

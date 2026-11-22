@@ -1,9 +1,10 @@
 fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=assets/rbridge.ico");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        // Require UAC elevation on the interactive CLI only;
-        // rbridge-daemon.exe runs as SYSTEM via Task Scheduler with no window.
-        println!("cargo:rustc-link-arg-bin=rbridge=/MANIFEST:EMBED");
-        println!("cargo:rustc-link-arg-bin=rbridge=/MANIFESTUAC:level='requireAdministrator'");
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("assets/rbridge.ico");
+        res.set("ProductName", "RBridge Control Center");
+        res.set("FileDescription", "RBridge — Modern Radeon Driver Patcher & Overclocker");
+        res.compile().expect("Failed to compile Windows icon resource");
     }
 }
