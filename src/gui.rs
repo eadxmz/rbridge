@@ -646,8 +646,32 @@ impl RBridgeApp {
         ui.add_space(10.0);
 
         Self::card_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.add(Self::primary_btn("Load VBIOS ROM (Oland.rom)")).clicked() {
+            ui.horizontal_wrapped(|ui| {
+                if ui.add(Self::primary_btn("Auto-Extract from ACPI")).clicked() {
+                    match powerplay::extract_powerplay_from_acpi() {
+                        Ok((pp, source)) => {
+                            self.stock_core_mhz = pp.boost_core_mhz;
+                            self.stock_mem_mhz = pp.boost_mem_mhz;
+                            self.target_core_mhz = pp.boost_core_mhz;
+                            self.target_mem_mhz = pp.boost_mem_mhz;
+                            self.rom_path_label = format!(
+                                "Extracted from {} ({} bytes, rev {}.{}, {} DPM states)",
+                                source,
+                                pp.table_bytes.len(),
+                                pp.format_rev,
+                                pp.content_rev,
+                                pp.states.len()
+                            );
+                            self.parsed_pp = Some(pp);
+                            self.set_status(
+                                format!("Auto-extracted & cached stock PowerPlay table from {}!", source),
+                                false,
+                            );
+                        }
+                        Err(e) => self.set_status(e, true),
+                    }
+                }
+                if ui.add(Self::secondary_btn("Load VBIOS ROM (.rom)")).clicked() {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("AMD VBIOS ROM", &["rom", "bin"])
                         .pick_file()

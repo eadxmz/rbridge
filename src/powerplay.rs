@@ -13,12 +13,25 @@ use crate::tweaks::{find_amd_class_subkey, RBRIDGE_REG};
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const ADL_MAX_PATH: usize = 256;
 const ADL_OK: c_int = 0;
+const ACPI_PROVIDER: u32 = 0x41435049; // 'ACPI'
+const VFCT_TABLE_ID: u32 = 0x54434656; // 'VFCT' (LE)
 
 #[link(name = "kernel32")]
 extern "system" {
     fn LoadLibraryA(lp_lib_file_name: *const c_char) -> *mut c_void;
     fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const c_char) -> *mut c_void;
     fn FreeLibrary(h_lib_module: *mut c_void) -> c_int;
+    fn EnumSystemFirmwareTables(
+        firmware_table_provider_signature: u32,
+        p_firmware_table_enum_buffer: *mut u8,
+        buffer_size: u32,
+    ) -> u32;
+    fn GetSystemFirmwareTable(
+        firmware_table_provider_signature: u32,
+        firmware_table_id: u32,
+        p_firmware_table_buffer: *mut u8,
+        buffer_size: u32,
+    ) -> u32;
 }
 
 extern "C" {
@@ -318,32 +331,42 @@ pub fn parse_powerplay_bytes(table: &[u8]) -> Result<ParsedPowerPlay, String> {
     })
 }
 
-pub fn extract_powerplay_from_rom(path: &Path) -> Result<ParsedPowerPlay, String> {
-    let rom = fs::read(path).map_err(|e| format!("Failed to read ROM file: {}", e))?;
-    if rom.len() < 0x100 {
-        return Err("File is too small to be a valid AMD VBIOS ROM.".into());
+fn find_atom_rom_slice(buf: &[u8]) -> Option<&[u8]> {
+    if buf.len() < 0x100 {
+        return None;
     }
-
-    let rom_hdr_off = u16_le(&rom, 0x48)? as usize;
-    if rom_hdr_off + 36 > rom.len() || &rom[rom_hdr_off + 4..rom_hdr_off + 8] != b"ATOM" {
-        return Err("Invalid VBIOS ROM: ATOM signature not found at ATOM_ROM_HEADER.".into());
+    for pos in 0..=buf.len() - 0x100 {
+        if buf[pos] == 0x55 && buf[pos + 1] == 0xAA {
+            let hdr_off = u16::from_le_bytes([buf[pos + 0x48], buf[pos + 0x49]]) as usize;
+            if hdr_off >= 0x4A
+                && pos + hdr_off + 36 <= buf.len()
+                && &buf[pos + hdr_off + 4..pos + hdr_off + 8] == b"ATOM"
+            {
+                return Some(&buf[pos..]);
+            }
+        }
     }
+    None
+}
 
-    let master_data_off = u16_le(&rom, rom_hdr_off + 32)? as usize;
-    let pp_off = u16_le(&rom, master_data_off + 34)? as usize;
+pub fn extract_powerplay_from_bytes(raw: &[u8]) -> Result<ParsedPowerPlay, String> {
+    let rom = find_atom_rom_slice(raw)
+        .ok_or_else(|| "No AMD ATOMBIOS signature (55 AA + ATOM) found in data.".to_string())?;
+
+    let rom_hdr_off = u16_le(rom, 0x48)? as usize;
+    let master_data_off = u16_le(rom, rom_hdr_off + 32)? as usize;
+    let pp_off = u16_le(rom, master_data_off + 34)? as usize;
     if pp_off == 0 || pp_off + 4 > rom.len() {
         return Err("PowerPlayInfo pointer is empty in MasterDataTable.".into());
     }
 
-    let pp_size = u16_le(&rom, pp_off)? as usize;
+    let pp_size = u16_le(rom, pp_off)? as usize;
     if pp_size < 32 || pp_off + pp_size > rom.len() {
         return Err(format!("Invalid PowerPlayInfo size ({} bytes).", pp_size));
     }
 
-    let table = &rom[pp_off..pp_off + pp_size];
-    let parsed = parse_powerplay_bytes(table)?;
+    let parsed = parse_powerplay_bytes(&rom[pp_off..pp_off + pp_size])?;
 
-    // Cache stock table in HKLM\SOFTWARE\RBridge so user only loads Oland.rom once
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     if let Ok((rb, _)) = hklm.create_subkey(RBRIDGE_REG) {
         let _ = rb.set_raw_value(
@@ -356,6 +379,57 @@ pub fn extract_powerplay_from_rom(path: &Path) -> Result<ParsedPowerPlay, String
     }
 
     Ok(parsed)
+}
+
+pub fn extract_powerplay_from_rom(path: &Path) -> Result<ParsedPowerPlay, String> {
+    let raw = fs::read(path).map_err(|e| format!("Failed to read ROM file: {}", e))?;
+    extract_powerplay_from_bytes(&raw)
+}
+
+fn read_acpi_table(table_id: u32) -> Option<Vec<u8>> {
+    unsafe {
+        let size = GetSystemFirmwareTable(ACPI_PROVIDER, table_id, null_mut(), 0);
+        if size == 0 || size > 16 * 1024 * 1024 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let written = GetSystemFirmwareTable(ACPI_PROVIDER, table_id, buf.as_mut_ptr(), size);
+        if written == 0 {
+            return None;
+        }
+        buf.truncate(written as usize);
+        Some(buf)
+    }
+}
+
+pub fn extract_powerplay_from_acpi() -> Result<(ParsedPowerPlay, String), String> {
+    if let Some(vfct) = read_acpi_table(VFCT_TABLE_ID) {
+        if let Ok(parsed) = extract_powerplay_from_bytes(&vfct) {
+            return Ok((parsed, "ACPI VFCT".into()));
+        }
+    }
+
+    unsafe {
+        let enum_size = EnumSystemFirmwareTables(ACPI_PROVIDER, null_mut(), 0);
+        if enum_size >= 4 && enum_size <= 65536 {
+            let mut raw_ids = vec![0u8; enum_size as usize];
+            let written = EnumSystemFirmwareTables(ACPI_PROVIDER, raw_ids.as_mut_ptr(), enum_size);
+            for chunk in raw_ids[..written as usize].chunks_exact(4) {
+                let id = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                if id == VFCT_TABLE_ID {
+                    continue;
+                }
+                if let Some(tbl) = read_acpi_table(id) {
+                    if let Ok(parsed) = extract_powerplay_from_bytes(&tbl) {
+                        let tag = String::from_utf8_lossy(chunk).into_owned();
+                        return Ok((parsed, format!("ACPI {}", tag)));
+                    }
+                }
+            }
+        }
+    }
+
+    Err("ACPI VFCT table not exposed by Dell BIOS (legacy ATRM mode). Load a matching 015.037.000.002 (1002 6660 - 1028 05EA) .rom file instead.".into())
 }
 
 pub fn load_cached_powerplay() -> Option<ParsedPowerPlay> {
@@ -417,7 +491,6 @@ pub fn apply_powerplay_oc(
         ));
     }
 
-    // Bump ulMaxODEngineClock / ulMaxODMemoryClock (32-bit LE pairs) if below requested clocks
     let mut od_bumped = 0usize;
     let mut j = 16usize;
     while j + 8 <= patched.len() {
@@ -471,7 +544,7 @@ pub fn apply_powerplay_oc(
     }
 
     Ok(format!(
-        "Injected PP_PhmSoftPowerPlayTable: {} DPM state(s) patched to {}/{} MHz ({} OD cap(s) raised). Click 'Reload AMD GPU' to activate immediately.",
+        "Injected PP_PhmSoftPowerPlayTable: {} DPM state(s) patched to {}/{} MHz ({} OD cap(s) raised). Click 'Reload AMD GPU Now' to activate.",
         dpm_hits, target_core, target_mem, od_bumped
     ))
 }
@@ -492,7 +565,7 @@ pub fn restore_factory_powerplay() -> Result<String, String> {
         let _ = rb.set_value("LastOcMem", &0u32);
     }
 
-    Ok("Removed PP_PhmSoftPowerPlayTable override. Click 'Reload AMD GPU' or reboot to return to stock VBIOS clocks.".into())
+    Ok("Removed PP_PhmSoftPowerPlayTable override. Click 'Reload AMD GPU Now' or reboot to return to stock VBIOS clocks.".into())
 }
 
 pub fn reload_amd_gpu() -> Result<String, String> {
