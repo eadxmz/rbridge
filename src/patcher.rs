@@ -819,6 +819,8 @@ fn read_setupapi_errors() -> Vec<String> {
         .filter(|l| l.contains("!!!") || l.contains("Error 0x"))
         .rev()
         .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
         .rev()
         .map(|s| format!("  [SetupAPI] {}", s.trim()))
         .collect()
